@@ -161,8 +161,27 @@ def test_zero_code_policy_engine_hot_swap():
         assert "POL-003" in updated_json
         assert "Hot-Swapped Rule `POL-003`" in banner
         assert "[POLICY ENGINE // CRITICAL] POL-003" in audit_last[3]
-        assert "DISCREPANCY DETECTED" in audit_last[4]
+        assert "POLICY HOLD" in audit_last[2]
+        assert "alert-box" in audit_last[4] and "DISCREPANCY DETECTED // POLICY EXCEPTION" in audit_last[4]
+        assert "ov-pill--alert" in audit_last[7] and "ov-line-row--flagged" in audit_last[7] and "hl-flag-pulse" in audit_last[7]
         assert "[POLICY ENGINE VIOLATION]" in audit_last[16]
+
+        # Check (3): Policy violations injected into XAI Chatbot context
+        sc_c = app.SCENARIOS[scenario_c]
+        chat_hist, _ = app.chat_with_auditor("Why did you flag this rule?", [], audit_last[9], sc_c["po_text"], sc_c["inv_text"])
+        bot_reply = chat_hist[-1]["content"]
+        assert "POL-003" in bot_reply or "Cap Over 400" in bot_reply or "BLOCK_PAYMENT" in bot_reply
+
+        # Check (1): Invalid JSON/YAML config pads all remaining outputs with gr.update()
+        bad_frames = list(app.hotswap_config_and_reaudit("{{{invalid-json-and-yaml"))
+        assert len(bad_frames) == 1
+        assert len(bad_frames[0]) == 19
+        assert "Hot-Swap Rejected" in bad_frames[0][1]
+        assert all(isinstance(x, dict) and "__type__" in x for x in bad_frames[0][2:])
+
+        # Check (4): pyyaml present in requirements.txt
+        req_text = Path("requirements.txt").read_text(encoding="utf-8").lower()
+        assert "pyyaml" in req_text
 
         # 3. YAML config hot-swap parses & applies cleanly
         yaml_cfg = (

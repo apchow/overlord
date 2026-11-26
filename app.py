@@ -922,6 +922,24 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
         discrepancy["policy_triggered"] = True
         if any(str(v.get("action", "")).upper() == "BLOCK_PAYMENT" for v in policy_violations):
             discrepancy["recovered"] = round(max(float(discrepancy.get("recovered", 0.0)), float(inv_amt)), 2)
+        ann_items = discrepancy.get("annotated_inv_items") or []
+        kw_terms = [
+            str(t).strip().lower()
+            for v in policy_violations
+            if v.get("operator") == "contains_any"
+            for t in (v.get("value") if isinstance(v.get("value"), list) else [v.get("value")])
+            if str(t).strip()
+        ]
+        matched_any = False
+        for item in ann_items:
+            desc_low = str(item.get("description", "")).lower()
+            if kw_terms and any(t in desc_low for t in kw_terms):
+                item["flagged"] = True
+                matched_any = True
+        if not matched_any and ann_items:
+            for item in ann_items:
+                item["flagged"] = True
+        discrepancy["annotated_inv_items"] = ann_items
 
     policy_summary_block = "\n".join(
         f"  - [{v.get('severity', 'HIGH')}] {v.get('reason', '')} -> {v.get('action', 'FLAG_REVIEW')}"
@@ -1155,7 +1173,20 @@ def _build_xai_fallback_reply(
             f"for {len(inv_parsed['line_items'])} line item(s){fee_note}."
         )
 
-    if any(k in msg for k in ("clause", "contract", "rag", "legal", "rule")):
+    if any(k in msg for k in ("clause", "contract", "rag", "legal", "rule", "policy", "policies")):
+        p_viol_early = audit_ctx.get("policy_violations") or []
+        if p_viol_early:
+            details = "\n".join(
+                f"- **`{v.get('id', 'POL')}` ({v.get('name', 'Policy Rule')}) [{v.get('severity', 'HIGH')}]:** "
+                f"{v.get('reason', '')} → Action: `{v.get('action', 'FLAG_REVIEW')}`"
+                for v in p_viol_early
+            )
+            return (
+                f"**Active Policy Engine Violations ({inv_id} / {po_id}):**\n\n"
+                f"{details}\n\n"
+                f"- **Invoice Billed:** `${inv_amt:,.2f}` | **Authorized PO:** `${po_amt:,.2f}` | "
+                f"**Protected Amount:** `${audit_ctx.get('recovered', inv_amt):,.2f}`"
+            )
         return (
             f"**Retrieved Gyansutr RAG Evidence ({po_id}):**\n\n"
             f"- **Authorized Cap:** `${po_amt:,.2f}`\n"
@@ -1263,6 +1294,16 @@ def chat_with_auditor(
     po_text = (po_text_input or "").strip() or ctx.get("po_text") or SCENARIOS[DEFAULT_SCENARIO]["po_text"]
     inv_text = (inv_text_input or "").strip() or ctx.get("invoice_text") or SCENARIOS[DEFAULT_SCENARIO]["inv_text"]
     gr_text = ctx.get("vision_summary") or SCENARIOS[DEFAULT_SCENARIO]["gr_status"]
+    policy_violations = ctx.get("policy_violations") or []
+    policy_ctx_str = (
+        "; ".join(
+            f"[{v.get('severity', 'HIGH')}] {v.get('id', 'POL')} ({v.get('name', 'Policy Rule')}): "
+            f"{v.get('reason', '')} -> Action={v.get('action', 'FLAG_REVIEW')}"
+            for v in policy_violations
+        )
+        if policy_violations
+        else "None triggered"
+    )
 
     system_prompt = (
         "You are a Senior Financial Auditor AI. You are currently auditing a 3-Way Match "
@@ -1271,9 +1312,11 @@ def chat_with_auditor(
         f"- PO: {po_text}\n"
         f"- GR: {gr_text}\n"
         f"- Invoice: {inv_text}\n"
+        f"- Triggered Policy Engine Violations: {policy_ctx_str}\n"
         "You must answer the user's questions based strictly on this context. "
         "If they ask 'What is the invoice about?', provide a 1-sentence summary of the invoice and its total. "
-        "If they ask 'Why did you flag this?', explain the $100 overcharge. "
+        "If they ask 'Why did you flag this?' or ask about policy rules, cite any Triggered Policy Engine Violations "
+        "(rule ID, name, reason, action) and/or any invoice/PO overcharge or GR shortage. "
         "If they ask an out-of-domain question (e.g., 'What is the capital of France?'), "
         "politely decline and steer them back to the audit."
     )
