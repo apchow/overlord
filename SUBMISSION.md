@@ -1,8 +1,13 @@
 # Hackathon Submission Copy (Devpost / Portal)
 
-**Project Name:** Project Overlord: The Financial Defense Engine (Track PS-BA1)
+**Project Name:** Project Overlord — Financial Defense Engine  
+**Track:** PS-BA1 · Three-Way Invoice, Purchase Order & Goods-Receipt Reconciliation
 
-**Description (~150 words):**
-Enterprises lose millions annually to Accounts Payable leakage when teams manually reconcile Purchase Orders (POs), Goods Receipts (GRs), and Vendor Invoices across siloed tools. **Project Overlord** solves Track **PS-BA1** with an autonomous, zero-touch 3-Way Match engine built on **LangGraph**, **Gemini 1.5 Pro**, **Gemini Vision**, and a **Gyansutr RAG** clause retriever.
+**Description:**
+Project Overlord helps Accounts Payable teams reconcile Purchase Orders, Goods Receipts, and vendor invoices before approving payment. Its five-node LangGraph workflow parses documents, inspects delivery evidence via Gemini Vision (with PIL XAI bounding boxes and Chaos Mode resilience), compares totals and line items, evaluates deterministic business policies, and independently verifies the audit outcome before settlement.
 
-Inside our Obsidian Mission Control **Gradio** dashboard, Overlord ingests PO pricing rules, visually verifies physical delivery proof from Goods Receipt images, and audits incoming vendor bills in under five seconds. When an unauthorized charge or short-delivery is detected, Overlord triggers XAI visual diffing highlights, flashes total funds recovered, drafts a legally grounded dispute email, and executes one-click vendor API dispatch backed by an immutable JSONL ledger. Complete with an Explainable AI Auditor Chatbot and adversarial **Chaos Mode**, Project Overlord turns passive AP review into active financial defense.
+Two live competition controls are built directly into the Mission Control cockpit:
+1. **Zero-Code Policy Hot-Swap & Re-Audit (`policy_engine.py` / `policies.json`):** Add or edit JSON/YAML rules through the UI form, code editor, file upload, or MCP server and immediately re-run audits without code edits — forcing a red **POLICY EXCEPTION — PAYMENT BLOCKED** hold even on previously clean matches.
+2. **One-Click Executive Boardroom Brief (`executive_brief.py`):** Export citation-backed **PDF, Markdown, or CSV** boardroom reports detailing processed counts, overcharge/hold exposure, CFO ROI scenario projections, and the Top 3 urgent exceptions anchored with exact source lines, policy rules, telemetry logs, and Supervisor/Vision math gates.
+
+Backed by SQLAlchemy persistence (`overlord_db.py`, SQLite or PostgreSQL via `DATABASE_URL`) + SHA-256 hash-chained compliance events + append-only JSONL receipts, an 11-tool FastMCP stdio server (`mcp_server.py`), local Ollama fallback routing (Qwen 5B / OLMoE), and a human-governed Continuous Improvement Agent (`improvement_agent.py`), Project Overlord moves Accounts Payable from spend visibility to provable financial action.

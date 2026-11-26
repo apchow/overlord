@@ -26,20 +26,26 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pymupdf>=1.24.0",
     "pillow>=10.0.0",
-    "qrcode>=8.0",
+    "pyyaml>=6.0",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "mcp>=1.26,<2",
+    "qrcode[pil]>=8.0",
+    "fastapi>=0.115.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.6.0",
+    "python-pptx>=1.0.0",
 ]
 
 [project.urls]
 Documentation = "README.md"
 
 [tool.setuptools]
-py-modules = ["app"]
+py-modules = ["app", "executive_brief", "improvement_agent", "policy_engine", "overlord_db", "mcp_server"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

@@ -10,6 +10,9 @@ venv
 .env
 .env.*
 !.env.example
+workspace/*.sqlite3
+workspace/*.sqlite3-shm
+workspace/*.sqlite3-wal
 workspace/receipts/*
 workspace/exports/*
 !workspace/receipts/.gitkeep

@@ -8,8 +8,9 @@ if str(ROOT_DIR) not in sys.path:
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
-from fastapi import FastAPI  # noqa: E402
 import gradio as gr  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+
 from app import demo  # noqa: E402
 
 fastapi_app = FastAPI(title="Project Overlord // Financial Defense Engine")

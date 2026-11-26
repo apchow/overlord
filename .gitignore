@@ -17,8 +17,14 @@ venv/
 .ruff_cache/
 .mypy_cache/
 
-# Runtime artefacts (ledger + certificates are generated, not source)
+# Runtime artefacts (database, ledger + certificates are generated, not source)
+workspace/*.sqlite3
+workspace/*.sqlite3-shm
+workspace/*.sqlite3-wal
 workspace/receipts/*.jsonl
 workspace/exports/*.json
+workspace/exports/*.pdf
+workspace/exports/*.md
+workspace/exports/*.csv
 !workspace/receipts/.gitkeep
 !workspace/exports/.gitkeep

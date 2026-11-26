@@ -1,26 +1,34 @@
-[
-  {
-    "id": "POL-001",
-    "name": "No Unauthorized Setup/Onboarding Fees",
-    "field": "invoice_text",
-    "operator": "contains_any",
-    "value": [
-      "setup fee",
-      "onboarding retainer",
-      "misc surcharge"
-    ],
-    "severity": "CRITICAL",
-    "action": "BLOCK_PAYMENT",
-    "active": true
-  },
-  {
-    "id": "POL-002",
-    "name": "Max Invoice Cap Without CFO Sign-off",
-    "field": "invoice_total",
-    "operator": ">",
-    "value": 5000,
-    "severity": "HIGH",
-    "action": "FLAG_CFO_REVIEW",
-    "active": true
-  }
-]
+{
+  "version": 1,
+  "rules": [
+    {
+      "rule_id": "POL-001",
+      "rule_name": "No Unauthorized Setup/Onboarding Fees",
+      "field": "invoice_text",
+      "operator": "contains_any",
+      "value": [
+        "setup fee",
+        "onboarding fee",
+        "onboarding retainer",
+        "misc surcharge",
+        "weekend surcharge",
+        "administrative fee"
+      ],
+      "severity": "CRITICAL",
+      "reason": "Invoice contains a prohibited ancillary fee without a countersigned change order.",
+      "action": "BLOCK_PAYMENT",
+      "active": true
+    },
+    {
+      "rule_id": "POL-002",
+      "rule_name": "Max Invoice Cap Without CFO Sign-off",
+      "field": "invoice_total",
+      "operator": ">",
+      "value": 5000,
+      "severity": "HIGH",
+      "reason": "Invoice total exceeds the $5,000 automatic-approval cap.",
+      "action": "FLAG_CFO_REVIEW",
+      "active": true
+    }
+  ]
+}

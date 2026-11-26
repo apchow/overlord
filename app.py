@@ -24,16 +24,18 @@ import operator
 import os
 import random
 import re
-import struct
+import socket
 import tempfile
 import time
-import zlib
+import urllib.parse
+import urllib.request
 from collections import Counter
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
-from typing import Annotated, Any, Generator, Optional, Tuple, TypedDict
+from typing import Annotated, Any, TypedDict
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -42,14 +44,22 @@ from google.genai import types
 from langgraph.graph import END, START, StateGraph
 from PIL import Image, ImageDraw
 
+import overlord_db
+from executive_brief import export_executive_brief
+from improvement_agent import analyze_feedback
 from policy_engine import (
+    DEFAULT_POLICIES,
+    PolicyValidationError,
     evaluate_policies,
     load_policies,
-    parse_policy_text,
+    next_policy_id,
+    parse_policy_config,
     save_policies,
 )
 
 load_dotenv()
+overlord_db.init_db()
+overlord_db.ensure_policy_baseline(load_policies())
 
 
 # ==============================================================================
@@ -172,7 +182,7 @@ AUDIT_RECEIPTS_PATH = os.path.join(BASE_DIR, "workspace", "receipts", "overlord_
 CERT_EXPORT_DIR = os.path.join(BASE_DIR, "workspace", "exports")
 
 
-def extract_uploaded_document_text(file_path: Optional[str]) -> str:
+def extract_uploaded_document_text(file_path: str | None) -> str:
     """Read real text from an uploaded PDF (via PyMuPDF) or plain-text file."""
     if not file_path or not os.path.isfile(file_path):
         return ""
@@ -194,12 +204,16 @@ def extract_uploaded_document_text(file_path: Optional[str]) -> str:
 
 
 def log_audit_receipt(record: dict[str, Any]) -> dict[str, Any]:
-    """Append-only fsync'd JSONL audit receipt (adapted from gyansutr/code/receipts.py)."""
+    """Persist an audit record to SQLite/PostgreSQL + fsync'd JSONL compatibility ledger."""
     os.makedirs(os.path.dirname(AUDIT_RECEIPTS_PATH), exist_ok=True)
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         **record,
     }
+    try:
+        entry = overlord_db.persist_audit_record(entry)
+    except Exception as exc:
+        print(f"[OVERLORD DB ERROR] Audit record persisted to JSONL fallback only: {type(exc).__name__}")
     line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
     with open(AUDIT_RECEIPTS_PATH, "a", encoding="utf-8", newline="\n") as f:
         f.write(line)
@@ -213,7 +227,7 @@ def read_audit_receipts(limit: int = 25) -> list[dict[str, Any]]:
     if not os.path.isfile(AUDIT_RECEIPTS_PATH):
         return []
     records: list[dict[str, Any]] = []
-    with open(AUDIT_RECEIPTS_PATH, "r", encoding="utf-8") as f:
+    with open(AUDIT_RECEIPTS_PATH, encoding="utf-8") as f:
         for line in f:
             try:
                 rec = json.loads(line)
@@ -225,7 +239,28 @@ def read_audit_receipts(limit: int = 25) -> list[dict[str, Any]]:
 
 
 def build_ledger_rows_and_total() -> tuple[list[list[Any]], float]:
-    """Format JSONL audit records for the Compliance Ledger Dataframe + cumulative recovered KPI."""
+    """Render the SQL audit history, falling back cleanly to the JSONL compatibility ledger."""
+    try:
+        db_records = overlord_db.list_audits(limit=50)
+        if db_records:
+            rows: list[list[Any]] = []
+            recovered_total = 0.0
+            for record in db_records:
+                recovered = float(record.get("recovered", 0.0) or 0.0)
+                recovered_total += recovered
+                rows.append([
+                    record.get("created_at", ""),
+                    record.get("po_id", "PO #8842"),
+                    record.get("invoice_id", "INV-2024-001"),
+                    record.get("audit_mode", "3-Way Match"),
+                    f"${float(record.get('po_authorized', 0.0)):,.2f}",
+                    f"${float(record.get('invoice_billed', 0.0)):,.2f}",
+                    f"${float(record.get('variance', 0.0)):,.2f}",
+                    record.get("status", "UNKNOWN"),
+                ])
+            return rows, round(recovered_total, 2)
+    except Exception:
+        pass
     records = read_audit_receipts(limit=50)
     rows: list[list[Any]] = []
     total_recovered = 0.0
@@ -248,7 +283,7 @@ def build_ledger_rows_and_total() -> tuple[list[list[Any]], float]:
     return rows, round(total_recovered, 2)
 
 
-def export_audit_certificate(audit_ctx: dict[str, Any]) -> Optional[str]:
+def export_audit_certificate(audit_ctx: dict[str, Any]) -> str | None:
     """Generate a downloadable JSON compliance certificate for the latest audit."""
     if not audit_ctx or not audit_ctx.get("executed"):
         gr.Warning("Run a 3-Way Match audit before exporting an Audit Certificate.")
@@ -322,7 +357,7 @@ def _embed_text(text: str, dims: int = 64) -> list[float]:
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))
+    return sum(x * y for x, y in zip(a, b, strict=True))
 
 
 # ==============================================================================
@@ -591,7 +626,7 @@ def draw_vision_xai_bounding_box(img_path: str, missing_label: str = "MISSING IN
 
 class OverlordState(TypedDict):
     po_text: str
-    gr_image_path: Optional[str]
+    gr_image_path: str | None
     invoice_text: str
     discrepancy: dict[str, Any]
     dispute_email: str
@@ -605,8 +640,9 @@ class OverlordState(TypedDict):
     status: str
     custom_rule: str
     hot_swap_violation: dict[str, Any]
-    policies: Optional[list[dict[str, Any]]]
+    policies: dict[str, Any] | list[dict[str, Any]] | None
     policy_violations: list[dict[str, Any]]
+    audit_id: str | None
     step_logs: list[str]
     logs: Annotated[list[str], operator.add]
 
@@ -619,7 +655,7 @@ def _log(msg: str) -> str:
     return f"[{_ts()}] {msg}"
 
 
-def _build_genai_client() -> Optional[genai.Client]:
+def _build_genai_client() -> genai.Client | None:
     api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
     if os.getenv("OVERLORD_LIVE_LLM", "1") != "1" or not api_key:
         return None
@@ -629,17 +665,109 @@ def _build_genai_client() -> Optional[genai.Client]:
         return None
 
 
+_OLLAMA_FALLBACK_MODELS: tuple[str, ...] = (
+    "qwen3:4b",
+    "qwen2.5:3b",
+    "olmoe:1b-7b",
+    "sam860/olmoe-1b-7b-0924",
+)
+
+
+def _call_local_ollama_safe(
+    prompt: str,
+    system_instruction: str | None = None,
+    model_name: str | None = None,
+    timeout_s: float = 5.0,
+) -> str | None:
+    """Call local Ollama (/api/chat) using stdlib urllib with fast TCP pre-check (<0.25s on Render)."""
+    raw_host = (
+        os.getenv("OLLAMA_HOST")
+        or os.getenv("OLLAMA_BASE_URL")
+        or "http://127.0.0.1:11434"
+    ).strip().rstrip("/")
+    parsed = urllib.parse.urlparse(raw_host if "://" in raw_host else f"http://{raw_host}")
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 11434)
+
+    try:
+        with socket.create_connection((host, port), timeout=0.25):
+            pass
+    except OSError:
+        return None
+
+    endpoint = f"{parsed.scheme or 'http'}://{host}:{port}/api/chat"
+    primary_local = (model_name or os.getenv("OVERLORD_LOCAL_MODEL") or os.getenv("OLLAMA_MODEL") or "qwen2.5:5b").strip()
+    extra_models = tuple(
+        m.strip()
+        for m in os.getenv("OLLAMA_FALLBACK_MODELS", "").split(",")
+        if m.strip()
+    )
+    candidates: list[str] = []
+    for m in (primary_local, *extra_models, *_OLLAMA_FALLBACK_MODELS):
+        if m and m not in candidates:
+            candidates.append(m)
+
+    messages: list[dict[str, str]] = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    messages.append({"role": "user", "content": prompt})
+
+    req_timeout = max(1.0, min(float(timeout_s), 5.0))
+    for candidate in candidates:
+        payload = json.dumps({
+            "model": candidate,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.1},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=req_timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8", errors="replace"))
+            content = ((body.get("message") or {}).get("content") or "").strip()
+            if content:
+                return content
+        except Exception:
+            continue
+    return None
+
+
 def _call_gemini_safe(
     prompt: str,
     *,
-    image_bytes: Optional[bytes] = None,
-    system_instruction: Optional[str] = None,
-    model_name: Optional[str] = None,
+    image_bytes: bytes | None = None,
+    system_instruction: str | None = None,
+    model_name: str | None = None,
     max_wait_s: float = 6.0,
-) -> Optional[str]:
-    """Call Gemini via google-genai SDK with a hard wall-clock cap; never stalls stage UI."""
+) -> str | None:
+    """Call Gemini (and/or Local Ollama fallback) with hard wall-clock caps; never stalls UI."""
+    backend = _RUNTIME_STATE.get("llm_backend", "Auto (Gemini → Local Ollama)")
+    if backend == "Offline Deterministic":
+        return None
+    if backend.startswith("Local Only"):
+        if image_bytes is not None:
+            return None
+        return _call_local_ollama_safe(
+            prompt,
+            system_instruction=system_instruction,
+            timeout_s=min(max_wait_s, 5.0),
+        )
+    if os.getenv("OVERLORD_LIVE_LLM", "1") != "1":
+        return None
+
     client = _build_genai_client()
     if client is None:
+        if image_bytes is None:
+            return _call_local_ollama_safe(
+                prompt,
+                system_instruction=system_instruction,
+                timeout_s=min(max_wait_s, 5.0),
+            )
         return None
     primary = model_name or os.getenv("GEMINI_PRO_MODEL", "gemini-3.5-flash").strip()
     fallback = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
@@ -657,7 +785,7 @@ def _call_gemini_safe(
         else None
     )
 
-    def _invoke() -> Optional[str]:
+    def _invoke() -> str | None:
         for candidate in (primary, fallback):
             if not candidate:
                 continue
@@ -676,12 +804,23 @@ def _call_gemini_safe(
 
     pool = ThreadPoolExecutor(max_workers=1)
     future = pool.submit(_invoke)
+    gemini_result: str | None = None
     try:
-        return future.result(timeout=max_wait_s)
+        gemini_result = future.result(timeout=max_wait_s)
     except Exception:
-        return None
+        gemini_result = None
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+
+    if gemini_result:
+        return gemini_result
+    if image_bytes is None:
+        return _call_local_ollama_safe(
+            prompt,
+            system_instruction=system_instruction,
+            timeout_s=min(max_wait_s, 5.0),
+        )
+    return None
 
 
 def po_parser_node(state: OverlordState) -> dict[str, Any]:
@@ -812,7 +951,7 @@ def _format_violation_line(v: dict[str, Any]) -> str:
 def render_hot_swap_alert_html(
     custom_rule: str = "",
     violated: bool = False,
-    policy_violations: Optional[list[dict[str, Any]]] = None,
+    policy_violations: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render the glowing Orange Policy Hot-Swap / Policy Engine Violation banner when triggered."""
     violations = policy_violations or []
@@ -857,7 +996,7 @@ def render_hot_swap_alert_html(
     )
 
 
-def _evaluate_hot_swap_rule(custom_rule: str, po_text: str, inv_text: str) -> tuple[bool, Optional[str]]:
+def _evaluate_hot_swap_rule(custom_rule: str, po_text: str, inv_text: str) -> tuple[bool, str | None]:
     """Evaluate a hot-swapped rule with instant deterministic fallback + Gemini LLM check."""
     rule_clean = (custom_rule or "").strip()
     if not rule_clean:
@@ -920,13 +1059,13 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
     if policy_triggered_only:
         discrepancy["detected"] = True
         discrepancy["policy_triggered"] = True
-        if any(str(v.get("action", "")).upper() == "BLOCK_PAYMENT" for v in policy_violations):
+        if any("BLOCK" in str(v.get("action", "")).upper() for v in policy_violations):
             discrepancy["recovered"] = round(max(float(discrepancy.get("recovered", 0.0)), float(inv_amt)), 2)
         ann_items = discrepancy.get("annotated_inv_items") or []
         kw_terms = [
             str(t).strip().lower()
             for v in policy_violations
-            if v.get("operator") == "contains_any"
+            if v.get("operator") in ("contains_any", "regex")
             for t in (v.get("value") if isinstance(v.get("value"), list) else [v.get("value")])
             if str(t).strip()
         ]
@@ -997,17 +1136,18 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
 
     discrepancy["reason"] = reason
 
-    log_audit_receipt({
+    audit_receipt = log_audit_receipt({
         "event": "OVERLORD_AUDIT",
         "po_id": po_id,
         "invoice_id": inv_id,
+        "scenario_name": state.get("scenario_name", ""),
         "audit_mode": audit_mode,
         "chaos_mode": chaos_hit,
         "po_authorized": po_amt,
         "invoice_billed": inv_amt,
         "variance": variance,
         "recovered": discrepancy["recovered"],
-        "policy_violations": [str(v.get("id") or v.get("rule_id") or "") for v in policy_violations],
+        "policy_violations": policy_violations,
         "status": "FLAGGED" if discrepancy["detected"] else "CLEARED",
     })
 
@@ -1055,6 +1195,7 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
         "discrepancy": discrepancy,
         "dispute_email": dispute_email,
         "status": "flagged" if (discrepancy["detected"] or hot_swap_violation["violated"]) else "cleared",
+        "audit_id": audit_receipt.get("audit_id"),
         "hot_swap_violation": hot_swap_violation,
         "policy_violations": policy_violations,
         "step_logs": logs,
@@ -1235,14 +1376,21 @@ def _build_xai_fallback_reply(
             f"funds of `${audit_ctx.get('recovered', inv_amt):,.2f}` have been protected under Short-Payment Hold."
         )
 
+    p_viol = audit_ctx.get("policy_violations") or []
     if variance > 0:
+        policy_note = ""
+        if p_viol:
+            summary_rules = "; ".join(
+                f"{v.get('rule_id') or v.get('id')}: {v.get('reason') or v.get('rule_name')}"
+                for v in p_viol
+            )
+            policy_note = f" Policy Engine also triggered: {summary_rules}."
         return (
             f"The Purchase Order ({po_id}) authorized a flat fee of ${po_amt:,.2f}. "
             f"The Vendor Invoice ({inv_id}) billed ${inv_amt:,.2f}, citing an unauthorized '{extra_label}'. "
-            f"Therefore, an overcharge of ${variance:,.2f} was detected."
+            f"Therefore, an overcharge of ${variance:,.2f} was detected.{policy_note}"
         )
 
-    p_viol = audit_ctx.get("policy_violations") or []
     if p_viol:
         summary_rules = "; ".join(str(v.get("reason") or v.get("id") or "Policy violation") for v in p_viol)
         return (
@@ -1294,10 +1442,14 @@ def chat_with_auditor(
     po_text = (po_text_input or "").strip() or ctx.get("po_text") or SCENARIOS[DEFAULT_SCENARIO]["po_text"]
     inv_text = (inv_text_input or "").strip() or ctx.get("invoice_text") or SCENARIOS[DEFAULT_SCENARIO]["inv_text"]
     gr_text = ctx.get("vision_summary") or SCENARIOS[DEFAULT_SCENARIO]["gr_status"]
+    po_amt = float(ctx.get("po_amount", 500.0) or 500.0)
+    inv_amt = float(ctx.get("inv_total", 600.0) or 600.0)
+    variance = float(ctx.get("variance", round(max(inv_amt - po_amt, 0.0), 2)) or 0.0)
     policy_violations = ctx.get("policy_violations") or []
     policy_ctx_str = (
         "; ".join(
-            f"[{v.get('severity', 'HIGH')}] {v.get('id', 'POL')} ({v.get('name', 'Policy Rule')}): "
+            f"[{v.get('severity', 'HIGH')}] {v.get('rule_id') or v.get('id', 'POL')} "
+            f"({v.get('rule_name') or v.get('name', 'Policy Rule')}): "
             f"{v.get('reason', '')} -> Action={v.get('action', 'FLAG_REVIEW')}"
             for v in policy_violations
         )
@@ -1312,13 +1464,15 @@ def chat_with_auditor(
         f"- PO: {po_text}\n"
         f"- GR: {gr_text}\n"
         f"- Invoice: {inv_text}\n"
+        f"- Verified Math Summary: PO Authorized=${po_amt:,.2f}, Invoice Billed=${inv_amt:,.2f}, Overcharge Variance=${variance:,.2f}\n"
         f"- Triggered Policy Engine Violations: {policy_ctx_str}\n"
         "You must answer the user's questions based strictly on this context. "
         "If they ask 'What is the invoice about?', provide a 1-sentence summary of the invoice and its total. "
-        "If they ask 'Why did you flag this?' or ask about policy rules, cite any Triggered Policy Engine Violations "
-        "(rule ID, name, reason, action) and/or any invoice/PO overcharge or GR shortage. "
+        "If they ask 'Why did you flag this?' or ask about policy rules, ALWAYS state the exact dollar figures "
+        "(PO amount, Invoice total, and overcharge variance when > $0) AND cite any Triggered Policy Engine Violations "
+        "(rule ID, name, reason, action) or GR shortage. "
         "If they ask an out-of-domain question (e.g., 'What is the capital of France?'), "
-        "politely decline and steer them back to the audit."
+        "politely decline without answering it and steer them back to the 3-Way Match audit."
     )
 
     recent_turns = "\n".join(
@@ -1326,7 +1480,7 @@ def chat_with_auditor(
     )
     prompt = f"{recent_turns}\nUSER: {text}".strip() if recent_turns else text
 
-    reply: Optional[str] = None
+    reply: str | None = None
     try:
         reply = _call_gemini_safe(
             prompt,
@@ -1351,7 +1505,7 @@ def chat_with_auditor(
 UPI_PAYMENT_STRING = "upi://pay?pa=9458175464@yesfam&pn=ProjectOverlord&am=500.00&cu=INR"
 
 
-def generate_upi_qr_image() -> tuple[Optional[str], bool]:
+def generate_upi_qr_image() -> tuple[str | None, bool]:
     """Generate a local UPI QR code PNG via qrcode; returns (path_or_none, used_fallback)."""
     out_path = os.path.join(tempfile.gettempdir(), "overlord_upi_qr.png")
     try:
@@ -1480,6 +1634,7 @@ def send_dispute_to_vendor(
 # ==============================================================================
 
 OVERLORD_HEAD = """
+<meta name="color-scheme" content="dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1606,8 +1761,9 @@ footer { display: none !important; visibility: hidden !important; }
 }
 .gradio-container [data-testid="block-label"] { background-color: var(--ov-panel-elevated) !important; border: 1px solid var(--ov-border) !important; color: var(--ov-text) !important; }
 .gradio-container [data-testid="block-info"], .gradio-container .info-text { color: var(--ov-text-dim) !important; background: transparent !important; }
-.gradio-container input[type="checkbox"] { background-color: var(--ov-panel-deep) !important; border: 1px solid var(--ov-border) !important; }
-.gradio-container input[type="checkbox"]:checked { background-color: var(--ov-green) !important; border-color: var(--ov-green) !important; }
+.gradio-container input[type="checkbox"], .gradio-container input[type="radio"] { background-color: var(--ov-panel-deep) !important; border: 1px solid var(--ov-border) !important; accent-color: var(--ov-green) !important; }
+.gradio-container input[type="checkbox"]:checked, .gradio-container input[type="radio"]:checked { background-color: var(--ov-green) !important; border-color: var(--ov-green) !important; }
+.gradio-container [data-testid="radio-group"] label { background-color: var(--ov-panel-deep) !important; border: 1px solid var(--ov-border) !important; border-radius: 6px !important; padding: 6px 10px !important; }
 
 /* Global Dark Input, Textbox, gr.Number & Slider Number Boxes */
 .gradio-container input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="button"]):not([type="submit"]),
@@ -1642,12 +1798,12 @@ footer { display: none !important; visibility: hidden !important; }
 }
 
 /* Shell & Sidebar */
-.ov-shell { gap: 0 !important; flex-wrap: nowrap !important; align-items: stretch !important; min-height: 100vh; }
+.ov-shell { gap: 0 !important; flex-wrap: nowrap !important; align-items: stretch !important; min-height: 100vh; min-height: 100dvh; }
 .ov-sidebar {
     background: var(--ov-panel) !important; border-right: 1px solid var(--ov-border) !important;
     min-width: 280px !important; max-width: 280px !important;
     padding: 20px 18px !important; gap: 11px !important;
-    position: sticky; top: 0; align-self: flex-start; min-height: 100vh;
+    position: sticky; top: 0; align-self: flex-start; min-height: 100vh; min-height: 100dvh;
 }
 .ov-main { padding: 16px 20px 26px 20px !important; gap: 12px !important; background: var(--ov-bg) !important; }
 .overlord-row { gap: 12px !important; align-items: stretch !important; }
@@ -1913,6 +2069,46 @@ ul.options li.item:hover, ul.options .item:hover, ul.options li.item.active, .op
     border: 1px solid var(--ov-border) !important;
     color: var(--ov-text-muted) !important;
 }
+
+/* Product Control Plane & 5-Agent Runbook Strip + Responsive Breakpoints */
+.ov-positioning { padding: 16px 18px; border: 1px solid rgba(52, 211, 153, 0.28); border-radius: 8px; background: radial-gradient(circle at 88% 0%, rgba(16, 185, 129, 0.12), transparent 35%), linear-gradient(135deg, #141a22, #0d1016 72%); }
+.ov-positioning-top { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; font: 10px var(--ov-font-mono); color: #9CA3AF; }
+.ov-positioning-tag { color: #6EE7B7; font-weight: 800; letter-spacing: 0.12em; }
+.ov-positioning h2 { margin: 10px 0 6px; color: #F3F4F6; font-size: clamp(18px, 2vw, 24px); line-height: 1.2; letter-spacing: -0.025em; }
+.ov-positioning-copy { max-width: 900px; margin: 0 0 12px; color: #B9C3CF; font-size: 12.5px; line-height: 1.5; }
+.ov-value-steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.ov-value-step { display: flex; flex-direction: column; gap: 4px; min-height: 70px; padding: 10px; border: 1px solid #29323a; border-radius: 6px; background: rgba(11, 15, 20, 0.78); }
+.ov-value-step span { color: #34D399; font: 10px var(--ov-font-mono); }
+.ov-value-step strong { color: #F3F4F6; font: 700 11px var(--ov-font-mono); letter-spacing: 0.08em; }
+.ov-value-step small { color: #9CA3AF; font-size: 10px; line-height: 1.35; }
+.ov-positioning-proof { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; padding: 8px 10px; border-left: 3px solid #34D399; background: #0b1214; color: #A7F3D0; font-size: 11px; }
+.ov-positioning-proof b { color: #6EE7B7; font: 700 9px var(--ov-font-mono); letter-spacing: 0.1em; margin-right: 4px; }
+.ov-positioning-proof span { color: #9CA3AF; }
+.ov-positioning-proof i { color: #34D399; font-style: normal; }
+.ov-positioning-proof strong { color: #ECFDF5; }
+.ov-positioning-guardrail { margin-top: 9px; color: #9CA3AF; font: 9px var(--ov-font-mono); letter-spacing: 0.06em; }
+.ov-positioning-guardrail b { color: #34D399; padding: 0 5px; }
+.ov-agent-board { padding: 10px 12px; border: 1px solid var(--ov-border); border-radius: 6px; background: linear-gradient(135deg, #11151d, #0c1016); margin-bottom: 4px; }
+.ov-agent-board-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; font: 10px var(--ov-font-mono); color: #A7F3D0; letter-spacing: 0.05em; margin-bottom: 8px; }
+.ov-agent-board-head span { color: #9CA3AF; letter-spacing: 0; }
+.ov-agent-steps { display: grid; grid-template-columns: repeat(5, minmax(84px, 1fr)); gap: 6px; }
+.ov-agent-step { display: flex; flex-direction: column; gap: 3px; padding: 8px; min-height: 60px; border: 1px solid #28313a; border-radius: 5px; background: #121720; }
+.ov-agent-step span { color: #34D399; font: 9.5px var(--ov-font-mono); }
+.ov-agent-step strong { color: #E5E7EB; font-size: 11px; }
+.ov-agent-step small { color: #9CA3AF; font-size: 9px; line-height: 1.25; }
+@media (max-width: 1100px) {
+    .ov-agent-steps { grid-template-columns: repeat(3, minmax(100px, 1fr)); }
+    .ov-metrics-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+    .ov-shell { flex-wrap: wrap !important; }
+    .ov-sidebar { position: relative !important; min-height: auto !important; min-width: 100% !important; max-width: 100% !important; }
+    .ov-main { padding: 12px !important; min-width: 0 !important; }
+    .overlord-row, .ov-cfo-row { flex-wrap: wrap !important; }
+    .overlord-row > *, .ov-cfo-row > * { min-width: min(100%, 340px) !important; }
+    .ov-agent-steps, .ov-value-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .ov-metrics-bar { grid-template-columns: 1fr; }
+}
 """
 
 
@@ -1924,17 +2120,25 @@ def render_topbar_html(
     recovered_amount: float = 0.0,
     flash: bool = False,
     status_text: str = "GYANSUTR RAG + LANGGRAPH // PS-BA1 ARMED",
+    policy_exception: bool = False,
 ) -> str:
     cls = "ov-impact-box ov-impact-box--flash" if flash else "ov-impact-box"
+    policy_style = ' style="background:#3A1518;border:2px solid #EF4444;color:#FCA5A5;"' if policy_exception else ""
+    label = "POLICY EXCEPTION (PAYMENT BLOCKED)" if policy_exception else "Financial Impact"
+    value = (
+        f"RED HOLD // DO NOT PAY — TOTAL RECOVERED: ${recovered_amount:,.2f}"
+        if policy_exception
+        else f"TOTAL RECOVERED: ${recovered_amount:,.2f}"
+    )
     return f"""
     <div class="ov-topbar">
       <div>
         <div class="ov-brand-eyebrow"><span class="ov-dot"></span><span>{escape(status_text)}</span></div>
         <h1 class="ov-brand-title">PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE</h1>
       </div>
-      <div class="{cls}">
-        <div class="ov-impact-label">Financial Impact</div>
-        <div class="ov-impact-value">TOTAL RECOVERED: ${recovered_amount:,.2f}</div>
+      <div class="{cls}"{policy_style}>
+        <div class="ov-impact-label">{label}</div>
+        <div class="ov-impact-value">{value}</div>
       </div>
     </div>
     """
@@ -1962,7 +2166,7 @@ def render_metrics_bar_html(
       <div class="{gr_card_cls}">
         <div class="ov-metric-head"><span>GR VERIFIED</span><span>[02]</span></div>
         <div class="{gr_val_cls}">{escape(gr_verified)}</div>
-        <div class="ov-metric-sub">Gemini 1.5 Flash Vision</div>
+        <div class="ov-metric-sub">Gemini 3.5 Flash Vision</div>
       </div>
       <div class="ov-metric-card">
         <div class="ov-metric-head"><span>INVOICE BILLED</span><span>[03]</span></div>
@@ -2008,7 +2212,7 @@ def render_invoice_html_from_text(
     inv_text: str,
     audit_mode: str = "3-Way Match",
     apply_tax: bool = False,
-    annotated_items: Optional[list[dict[str, Any]]] = None,
+    annotated_items: list[dict[str, Any]] | None = None,
     flagged: bool = False,
     cleared: bool = False,
 ) -> str:
@@ -2068,7 +2272,7 @@ def render_findings_html(
     variance: float = 100.0,
     reason: str = "",
     chaos_triggered: bool = False,
-    policy_violations: Optional[list[dict[str, Any]]] = None,
+    policy_violations: list[dict[str, Any]] | None = None,
 ) -> str:
     if state == "idle":
         return '<div class="findings-idle">AUDIT FINDINGS :: Awaiting LangGraph execution...</div>'
@@ -2086,12 +2290,93 @@ def render_findings_html(
         headline = f"VISION ALERT + ${variance:,.2f} OVERCHARGE"
     elif chaos_triggered:
         headline = "VISION ALERT: SHORT-PAYMENT INITIATED"
+    elif variance > 0 and violations:
+        headline = f"DISCREPANCY DETECTED: ${variance:,.2f} OVERCHARGE // POLICY EXCEPTION (PAYMENT BLOCKED)"
     elif variance > 0:
         headline = f"DISCREPANCY DETECTED: ${variance:,.2f} OVERCHARGE"
     else:
         actions = ", ".join(dict.fromkeys(str(v.get("action") or "POLICY_HOLD") for v in violations))
-        headline = f"DISCREPANCY DETECTED // POLICY EXCEPTION ({escape(actions)})"
-    return f'<div class="alert-box"><div class="alert-title">{headline}</div><div class="alert-body">{escape(reason)}</div></div>'
+        headline = f"DISCREPANCY DETECTED // POLICY EXCEPTION (PAYMENT BLOCKED) — {escape(actions)}"
+    extra_rules = ""
+    if violations:
+        rules_lines = "<br>".join(
+            f"<b>{escape(str(v.get('rule_id') or v.get('id') or 'POL'))}</b> — "
+            f"{escape(str(v.get('reason') or v.get('rule_name') or 'Policy triggered'))}"
+            for v in violations
+        )
+        extra_rules = f"<div style='margin-top:6px;padding-top:6px;border-top:1px solid rgba(254,202,202,0.22);'>{rules_lines}</div>"
+    return f'<div class="alert-box"><div class="alert-title">{headline}</div><div class="alert-body">{escape(reason)}{extra_rules}</div></div>'
+
+
+def render_storage_status_html() -> str:
+    """Render sidebar storage engine telemetry + SHA-256 hash-chain verification."""
+    try:
+        info = overlord_db.database_health()
+        proof = overlord_db.verify_compliance_ledger()
+        engine = escape(str(info["dialect"]).upper())
+        proof_label = "HASH CHAIN VERIFIED" if proof["valid"] else "HASH CHAIN ALERT"
+        proof_color = "#34D399" if proof["valid"] else "#F87171"
+        durability = "SQLite local + JSONL" if info["dialect"] == "sqlite" else "Managed PostgreSQL + JSONL"
+        return (
+            '<div style="margin:2px 0;padding:8px 10px;border:1px solid #2A2D37;border-radius:6px;'
+            'background:#0D0F14;font-family:var(--ov-font-mono);font-size:10px;line-height:1.45;color:#9CA3AF;">'
+            f'<div style="color:#E7E9EE;font-weight:700;">STORAGE // {engine}</div>'
+            f'<div>{durability} · {info["audit_count"]} runs · {info["policy_revision_count"]} rev</div>'
+            f'<div style="color:{proof_color};">{proof_label} · {proof["events_checked"]} events</div>'
+            "</div>"
+        )
+    except Exception as exc:
+        return (
+            '<div style="margin:2px 0;padding:8px 10px;border:1px solid #7F1D1D;border-radius:6px;'
+            'background:#321719;color:#FCA5A5;font-family:var(--ov-font-mono);font-size:10px;">'
+            f'STORAGE STATUS // {escape(type(exc).__name__)}</div>'
+        )
+
+
+def render_positioning_panel_html() -> str:
+    """Product category contrast and proof-based positioning strip."""
+    stages = [
+        ("01", "DETECT", "Find invoice, delivery, and policy exceptions"),
+        ("02", "PROVE", "Cite the source line, clause, and math"),
+        ("03", "CONTROL", "Hold, clear, or escalate with human oversight"),
+        ("04", "LEARN", "Use reviewed outcomes to improve governed rules"),
+    ]
+    cards = "".join(
+        f'<div class="ov-value-step"><span>{number}</span><strong>{title}</strong><small>{detail}</small></div>'
+        for number, title, detail in stages
+    )
+    return (
+        '<section class="ov-positioning" aria-label="Overlord value proposition">'
+        '<div class="ov-positioning-top"><span class="ov-positioning-tag">FINANCIAL DEFENSE / CONTROL PLANE</span>'
+        '<span class="ov-positioning-audience">For AP and finance teams managing vendor spend</span></div>'
+        "<h2>From spend visibility to provable financial action.</h2>"
+        '<p class="ov-positioning-copy">A dashboard can surface an anomaly. Overlord connects the source evidence to a deterministic decision, a governed next step, and an auditable outcome.</p>'
+        f'<div class="ov-value-steps">{cards}</div>'
+        '<div class="ov-positioning-proof"><b>THE DIFFERENCE</b><span>Insight-only: alert + task</span><i>→</i>'
+        "<strong>Overlord: evidence + decision + action + audit receipt</strong></div>"
+        '<div class="ov-positioning-guardrail">POLICY MATH IS DETERMINISTIC <b>·</b> AI ASSISTS EVIDENCE <b>·</b> FINANCIAL ACTIONS STAY GOVERNED</div>'
+        "</section>"
+    )
+
+
+def render_agent_framework_html() -> str:
+    """Show the five real LangGraph stages as an executive-readable run path."""
+    agents = [
+        ("01", "PO Parser", "Authorized scope + clauses"),
+        ("02", "Vision Agent", "Receipt evidence + XAI"),
+        ("03", "Invoice Parser", "Vendor lines + totals"),
+        ("04", "Auditor", "Deterministic 3-way match"),
+        ("05", "Supervisor", "Decision + audit receipt"),
+    ]
+    cards = "".join(
+        f'<div class="ov-agent-step"><span>{number}</span><strong>{name}</strong><small>{detail}</small></div>'
+        for number, name, detail in agents
+    )
+    return (
+        '<div class="ov-agent-board"><div class="ov-agent-board-head">'
+        '<b>CONTROL PLANE / FIVE-NODE AUDIT RUN</b><span>LLM assists extraction; policy math stays deterministic</span>'
+        f'</div><div class="ov-agent-steps">{cards}</div></div>'
+    )
 
 
 def render_ledger_kpi_html() -> str:
@@ -2108,11 +2393,18 @@ def render_ledger_kpi_html() -> str:
 # 9. STREAMING AUDIT GENERATOR (WITH HARDENED SAFETY NETS)
 # ==============================================================================
 
-_RUNTIME_STATE = {"chaos_mode": False}
+_RUNTIME_STATE = {
+    "chaos_mode": False,
+    "llm_backend": "Auto (Gemini → Local Ollama)",
+}
 
 
 def on_chaos_toggle(enabled: bool) -> None:
     _RUNTIME_STATE["chaos_mode"] = bool(enabled)
+
+
+def on_llm_backend_change(backend: str) -> None:
+    _RUNTIME_STATE["llm_backend"] = backend or "Auto (Gemini → Local Ollama)"
 
 
 def run_audit(
@@ -2125,7 +2417,7 @@ def run_audit(
     apply_tax: bool = False,
     custom_rule_text: str = "",
     custom_rule_file: Any = None,
-    policies: Optional[list[dict[str, Any]]] = None,
+    policies: dict[str, Any] | list[dict[str, Any]] | None = None,
 ) -> Generator[tuple[Any, ...], None, None]:
     """Execute the 5-Node LangGraph StateGraph against live/edited PO, GR, and Invoice inputs."""
     sc = SCENARIOS.get(scenario_name, SCENARIOS[DEFAULT_SCENARIO])
@@ -2133,6 +2425,7 @@ def run_audit(
     live_inv_text = (inv_text_input or "").strip() or sc["inv_text"]
     custom_rule = _extract_custom_rule(custom_rule_text, custom_rule_file)
     active_policies = policies if policies is not None else load_policies()
+    active_rules = active_policies.get("rules", []) if isinstance(active_policies, dict) else (active_policies or [])
     init_logs: list[str] = []
     if custom_rule:
         init_logs.append(_log(f'[POLICY HOT-SWAP] Injecting custom rule: "{custom_rule}" into Auditor Node...'))
@@ -2177,6 +2470,7 @@ def run_audit(
         "hot_swap_violation": {"violated": False, "rule": custom_rule},
         "policies": active_policies,
         "policy_violations": [],
+        "audit_id": None,
         "step_logs": [],
         "logs": [],
     }
@@ -2234,20 +2528,42 @@ def run_audit(
 
                     audit_ctx = {
                         "executed": is_done,
+                        "audit_id": snapshot.get("audit_id"),
                         "po_id": po_data.get("po_number", sc["po_id"]),
                         "inv_id": inv_data.get("invoice_number", sc["inv_id"]),
+                        "vendor": po_data.get("vendor", sc["vendor"]),
+                        "vendor_name": po_data.get("vendor", sc["vendor"]),
+                        "audit_mode": audit_mode,
+                        "scenario_name": scenario_name,
+                        "status": "flagged" if flagged else "cleared",
                         "po_amount": po_amt,
                         "inv_total": inv_amt,
                         "variance": variance,
                         "recovered": recovered,
                         "extra_label": disc.get("primary_extra_label", "Setup Fee"),
+                        "po_data": po_data,
+                        "invoice_data": inv_data,
+                        "gr_data": gr_data,
+                        "discrepancy": disc,
+                        "flagged_items": disc.get("flagged_items", []),
+                        "annotated_inv_items": disc.get("annotated_inv_items", []),
                         "chaos_triggered": chaos_hit,
+                        "vision_bbox_drawn": bool(gr_data.get("xai_bbox_drawn", False)),
                         "vision_summary": gr_data.get("vision_summary", sc["gr_status"]),
                         "vision_confidence": gr_data.get("confidence", "99.4%"),
+                        "short_shipped_units": gr_data.get(
+                            "short_shipped_units",
+                            max(int(sc.get("gr_expected_qty", sc.get("gr_delivered_qty", 0))) - int(sc.get("gr_delivered_qty", 0)), 0),
+                        ),
                         "rag_clause": (po_data.get("retrieved_sections") or ["Section 1.2"])[0],
+                        "rag_context": po_data.get("retrieved_context", ""),
                         "po_text": live_po_text,
                         "invoice_text": live_inv_text,
                         "policy_violations": p_violations,
+                        "policy_rule_count": len(active_rules),
+                        "hot_swap_violation": snapshot.get("hot_swap_violation") or {},
+                        "telemetry_logs": list(cumulative_logs),
+                        "telemetry": "\n".join(cumulative_logs),
                     }
 
                     chat_init = (
@@ -2276,7 +2592,16 @@ def run_audit(
 
                     last_payload = (
                         gr.update(interactive=is_done, value="Execute 3-Way Match" if is_done else "Executing Pipeline..."),
-                        render_topbar_html(recovered_amount=recovered if is_done else 0.0, flash=is_done and flagged),
+                        render_topbar_html(
+                            recovered_amount=recovered if is_done else 0.0,
+                            flash=is_done and flagged,
+                            status_text=(
+                                "POLICY ENGINE // PAYMENT BLOCKED"
+                                if p_violations
+                                else "GYANSUTR RAG + LANGGRAPH // PS-BA1 ARMED"
+                            ),
+                            policy_exception=bool(p_violations),
+                        ),
                         render_metrics_bar_html(
                             po_authorized=f"${po_amt:,.2f}" if has_po else "--",
                             gr_verified=gr_ver,
@@ -2345,24 +2670,28 @@ def run_audit(
             yield (gr.update(interactive=True, value="Execute 3-Way Match"), *last_payload[1:])
 
 
-def _format_policy_status_md(policies: Optional[list[dict[str, Any]]] = None) -> str:
+def _extract_policy_rules(policies: dict[str, Any] | list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if policies is None:
+        loaded = load_policies()
+        return loaded.get("rules", []) if isinstance(loaded, dict) else list(loaded)
+    if isinstance(policies, dict):
+        return list(policies.get("rules", []))
+    return list(policies)
+
+
+def _format_policy_status_md(policies: dict[str, Any] | list[dict[str, Any]] | None = None) -> str:
     """Format a concise live summary of the active rules loaded from policies.json."""
-    rules = policies if policies is not None else load_policies()
+    rules = _extract_policy_rules(policies)
     active_count = sum(1 for r in rules if r.get("active", True))
-    tags = ", ".join(f"`{r.get('id', 'POL')}`" for r in rules[:8])
+    tags = ", ".join(f"`{r.get('rule_id') or r.get('id') or 'POL'}`" for r in rules[:8])
     if len(rules) > 8:
         tags += f" (+{len(rules) - 8} more)"
     suffix = f" — {tags}" if tags else ""
     return f"**Live Policy Engine:** `{active_count}` active / `{len(rules)}` total rule(s) in `policies.json`{suffix}"
 
 
-def _next_policy_id(policies: list[dict[str, Any]]) -> str:
-    max_num = 0
-    for rule in policies:
-        m = re.search(r"(\d+)$", str(rule.get("id") or ""))
-        if m:
-            max_num = max(max_num, int(m.group(1)))
-    return f"POL-{max(max_num + 1, len(policies) + 1):03d}"
+def _next_policy_id(policies: dict[str, Any] | list[dict[str, Any]]) -> str:
+    return next_policy_id(_extract_policy_rules(policies))
 
 
 def _parse_rule_value(op: str, raw_val: Any) -> tuple[bool, Any, str]:
@@ -2370,7 +2699,7 @@ def _parse_rule_value(op: str, raw_val: Any) -> tuple[bool, Any, str]:
     if raw_val is None or (isinstance(raw_val, str) and not raw_val.strip()):
         return False, None, "Threshold / Value cannot be empty."
 
-    if op in (">", ">=", "<"):
+    if op in (">", ">=", "<", "<="):
         text = str(raw_val).strip().replace("$", "").replace(",", "").replace("%", "").strip()
         try:
             num = float(text)
@@ -2380,7 +2709,7 @@ def _parse_rule_value(op: str, raw_val: Any) -> tuple[bool, Any, str]:
             return False, None, f"Operator `{op}` requires a finite numeric threshold."
         return True, (int(num) if num.is_integer() else num), ""
 
-    if op == "!=":
+    if op in ("==", "!="):
         text = str(raw_val).strip()
         cleaned = text.replace("$", "").replace(",", "").replace("%", "").strip()
         try:
@@ -2408,10 +2737,18 @@ def _parse_rule_value(op: str, raw_val: Any) -> tuple[bool, Any, str]:
             return False, None, "Operator `contains_any` requires at least one keyword (comma-separated)."
         return True, terms, ""
 
+    if op == "regex":
+        pattern = str(raw_val).strip()
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            return False, None, f"Invalid regex pattern: {exc}"
+        return True, pattern, ""
+
     return False, None, f"Unsupported operator `{op}`."
 
 
-def _on_policy_file_upload(file_path: Optional[str]) -> tuple[Any, str]:
+def _on_policy_file_upload(file_path: str | None) -> tuple[Any, str]:
     """Load an uploaded .json or .yaml policy file into the live Code editor and validate it."""
     if not file_path or not os.path.isfile(str(file_path)):
         return gr.update(), _format_policy_status_md()
@@ -2420,13 +2757,30 @@ def _on_policy_file_upload(file_path: Optional[str]) -> tuple[Any, str]:
     except Exception as exc:
         return gr.update(), f"⚠️ **Upload Read Error:** {exc}"
 
-    rules, msg = parse_policy_text(raw)
+    try:
+        config = parse_policy_config(raw, str(file_path))
+    except PolicyValidationError as exc:
+        name = os.path.basename(str(file_path))
+        return raw, f"⚠️ **Invalid Policy File (`{name}`):** {exc}"
     name = os.path.basename(str(file_path))
-    if not msg.startswith("Parsed "):
-        return raw, f"⚠️ **Invalid Policy File (`{name}`):** {msg}"
+    count = len(config["rules"])
     return (
         raw,
-        f"📄 **Loaded `{name}`** ({msg}). Click **🔄 Hot-Swap Config & Re-Run Audit** to persist and re-audit ({len(rules)} rules).",
+        f"📄 **Loaded `{name}`** ({count} rules). Click **🔄 Hot-Swap Config & Re-Run Audit** to persist and re-audit.",
+    )
+
+
+AUDIT_OUTPUT_COUNT = 17
+
+
+def _policy_error_outputs(message: str) -> tuple[Any, ...]:
+    """Compatibility helper matching Gradio error padding length."""
+    outputs = globals().get("audit_outputs")
+    audit_count = len(outputs) if outputs is not None else AUDIT_OUTPUT_COUNT
+    return (
+        f"❌ **Policy validation error:** {escape(message)}",
+        gr.update(),
+        *(gr.update() for _ in range(audit_count)),
     )
 
 
@@ -2442,15 +2796,16 @@ def add_rule_and_reaudit(
     """Persist a new Quick Rule Builder rule to policies.json and stream a live re-audit."""
     ok, parsed_val, err_msg = _parse_rule_value(str(r_op or ""), r_val)
     if not ok:
-        yield (gr.update(), f"⚠️ **Rule Validation Error:** {err_msg}", *([gr.update()] * 17))
+        yield (gr.update(), f"⚠️ **Rule Validation Error:** {err_msg}", *([gr.update()] * AUDIT_OUTPUT_COUNT))
         return
 
-    policies = load_policies()
-    next_id = _next_policy_id(policies)
+    config = load_policies()
+    rules = list(config.get("rules", []))
+    next_id = next_policy_id(rules)
     rule_name = (r_name or "").strip() or f"{r_field} {r_op} {parsed_val}"
     new_rule: dict[str, Any] = {
-        "id": next_id,
-        "name": rule_name,
+        "rule_id": next_id,
+        "rule_name": rule_name,
         "field": str(r_field or "invoice_total").strip(),
         "operator": str(r_op or ">").strip(),
         "value": parsed_val,
@@ -2458,17 +2813,17 @@ def add_rule_and_reaudit(
         "action": str(r_act or "BLOCK_PAYMENT").strip(),
         "active": True,
     }
-    policies.append(new_rule)
-    save_policies(policies)
+    config["rules"] = rules + [new_rule]
+    saved = save_policies(config, source="ui-quick-builder")
 
-    updated_json = json.dumps(policies, indent=2, ensure_ascii=False)
-    active_count = sum(1 for r in policies if r.get("active", True))
+    updated_json = json.dumps(saved, indent=2, ensure_ascii=False)
+    active_count = sum(1 for r in saved["rules"] if r.get("active", True))
     banner = (
         f"✅ **Hot-Swapped Rule `{next_id}` (`{rule_name}`):** "
         f"`{new_rule['field']} {new_rule['operator']} {parsed_val}` → `{new_rule['action']}` "
-        f"| `{active_count}` active / `{len(policies)}` total rule(s) in `policies.json`."
+        f"| `{active_count}` active / `{len(saved['rules'])}` total rule(s) in `policies.json`."
     )
-    for frame in run_audit(*audit_args, policies=policies):
+    for frame in run_audit(*audit_args, policies=saved):
         yield (updated_json, banner, *frame)
 
 
@@ -2479,36 +2834,228 @@ def hotswap_config_and_reaudit(
 ) -> Generator[tuple[Any, ...], None, None]:
     """Parse JSON/YAML policy config, persist to policies.json, and stream a live re-audit."""
     source_text = (raw_policy_text or "").strip()
+    filename: str | None = None
     if not source_text and uploaded_policy_file:
         file_path = getattr(uploaded_policy_file, "name", uploaded_policy_file)
         if file_path and os.path.isfile(str(file_path)):
+            filename = str(file_path)
             try:
-                source_text = Path(str(file_path)).read_text(encoding="utf-8", errors="replace").strip()
+                source_text = Path(filename).read_text(encoding="utf-8", errors="replace").strip()
             except Exception as exc:
                 yield (
                     raw_policy_text or "",
                     f"⚠️ **File Read Error:** {exc}",
-                    *([gr.update()] * 17),
+                    *([gr.update()] * AUDIT_OUTPUT_COUNT),
                 )
                 return
 
-    rules, msg = parse_policy_text(source_text)
-    if not msg.startswith("Parsed "):
+    try:
+        config = parse_policy_config(source_text, filename)
+    except Exception as exc:
         yield (
             raw_policy_text or source_text,
-            f"⚠️ **Hot-Swap Rejected:** {msg}",
-            *([gr.update()] * 17),
+            f"⚠️ **Hot-Swap Rejected:** {exc}",
+            *([gr.update()] * AUDIT_OUTPUT_COUNT),
         )
         return
 
-    save_policies(rules)
-    updated_json = json.dumps(rules, indent=2, ensure_ascii=False)
-    active_count = sum(1 for r in rules if r.get("active", True))
+    saved = save_policies(config, source="ui-config-editor")
+    updated_json = json.dumps(saved, indent=2, ensure_ascii=False)
+    active_count = sum(1 for r in saved["rules"] if r.get("active", True))
     banner = (
-        f"✅ **Hot-Swapped Policy Config:** {msg} Saved to `policies.json` "
-        f"(`{active_count}` active / `{len(rules)}` total)."
+        f"✅ **Hot-Swapped Policy Config:** Validated `{len(saved['rules'])}` rule(s) and saved atomically to `policies.json` "
+        f"(`{active_count}` active / `{len(saved['rules'])}` total)."
     )
-    for frame in run_audit(*audit_args, policies=rules):
+    for frame in run_audit(*audit_args, policies=saved):
+        yield (updated_json, banner, *frame)
+
+
+def hot_swap_config_and_reaudit(
+    editor_text: str,
+    upload_path: Any = None,
+    *audit_args: Any,
+) -> Generator[tuple[Any, ...], None, None]:
+    """Compatibility wrapper yielding (status, editor, *frame) with validated padding."""
+    source_text = (editor_text or "").strip()
+    filename: str | None = None
+    if upload_path:
+        path = Path(str(getattr(upload_path, "name", upload_path)))
+        if path.is_file():
+            filename = str(path)
+            source_text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        config = parse_policy_config(source_text, filename)
+        saved = save_policies(config, source="ui-config-editor")
+    except Exception as exc:
+        yield _policy_error_outputs(str(exc))
+        return
+    rendered = json.dumps(saved, indent=2, ensure_ascii=False)
+    for frame in run_audit(*audit_args, policies=saved):
+        yield ("✅ Config validated and atomically hot-swapped. Audit re-run complete.", rendered, *frame)
+
+
+def reset_policies_and_reaudit(*audit_args: Any) -> Generator[tuple[Any, ...], None, None]:
+    """Restore the default POL-001 & POL-002 policy rules and stream a live re-audit."""
+    saved = save_policies(DEFAULT_POLICIES, source="ui-reset-defaults")
+    updated_json = json.dumps(saved, indent=2, ensure_ascii=False)
+    banner = "✅ **Policies Reset:** Restored default rules `POL-001` & `POL-002` in `policies.json`."
+    for frame in run_audit(*audit_args, policies=saved):
+        yield (updated_json, banner, *frame)
+
+
+def handle_export_executive_brief(
+    audit_ctx: Any,
+    export_format: str,
+    cfo_monthly_invoices: float,
+    cfo_avg_val: float,
+    cfo_error_rate: float,
+) -> tuple[str | None, str]:
+    """Export an Executive Boardroom Brief (PDF, Markdown, or CSV) with auditable citations."""
+    ctx = audit_ctx if isinstance(audit_ctx, dict) else {}
+    if not ctx.get("executed"):
+        try:
+            gr.Warning("Run Execute 3-Way Match before exporting an Executive Brief.")
+        except Exception:
+            pass
+        return None, "⚠️ **No Audit Executed:** Run **Execute 3-Way Match** first to generate an Executive Brief."
+    ledger_rows, cumulative_recovered = build_ledger_rows_and_total()
+    file_path, md_preview = export_executive_brief(
+        audit_ctx,
+        export_format=export_format,
+        export_dir=CERT_EXPORT_DIR,
+        ledger_rows=ledger_rows,
+        cumulative_recovered=cumulative_recovered,
+        cfo_monthly_invoices=cfo_monthly_invoices,
+        cfo_avg_val=cfo_avg_val,
+        cfo_error_rate=cfo_error_rate,
+    )
+    try:
+        gr.Info(f"Exported Executive Brief: {os.path.basename(file_path)}")
+    except Exception:
+        pass
+    return file_path, md_preview
+
+
+def export_executive_boardroom_brief(
+    audit_ctx: Any,
+    output_format: str = "PDF",
+    cfo_monthly_invoices: float = 5000,
+    cfo_avg_val: float = 600,
+    cfo_error_rate: float = 2.5,
+) -> tuple[str | None, str, str]:
+    """Boardroom brief exporter returning (path, status, preview) for Phase 1 API callers."""
+    ctx = audit_ctx if isinstance(audit_ctx, dict) else {}
+    if not ctx.get("executed"):
+        return None, "❌ Run an audit to completion before exporting the executive brief.", ""
+    try:
+        ledger_rows, cumulative_recovered = build_ledger_rows_and_total()
+        from executive_brief import build_brief_data, render_brief_csv, render_brief_markdown, write_brief_pdf
+
+        brief = build_brief_data(
+            ctx,
+            ledger_rows,
+            cumulative_recovered,
+            float(cfo_monthly_invoices),
+            float(cfo_avg_val),
+            float(cfo_error_rate),
+        )
+        markdown = render_brief_markdown(brief)
+        selected_format = (output_format or "PDF").strip().upper()
+        extension = {"PDF": ".pdf", "MARKDOWN": ".md", "MD": ".md", "CSV": ".csv"}.get(selected_format)
+        if extension is None:
+            raise ValueError("Choose PDF, Markdown, or CSV as the export format.")
+        os.makedirs(CERT_EXPORT_DIR, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        invoice_slug = re.sub(r"[^A-Za-z0-9_-]+", "-", brief["inv_id"]).strip("-") or "audit"
+        path = os.path.join(CERT_EXPORT_DIR, f"OVERLORD-BOARDROOM-{invoice_slug}-{stamp}{extension}")
+        if selected_format == "PDF":
+            write_brief_pdf(brief, path)
+            preview = markdown
+        elif selected_format in {"MARKDOWN", "MD"}:
+            Path(path).write_text(markdown, encoding="utf-8")
+            preview = markdown
+        else:
+            from executive_brief import build_executive_brief
+
+            legacy_brief = build_executive_brief(ctx)
+            csv_text = render_brief_csv(legacy_brief)
+            Path(path).write_text(csv_text, encoding="utf-8-sig", newline="")
+            preview = (
+                "```csv\n"
+                + "\n".join(csv_text.splitlines()[:18])
+                + ("\n… preview truncated" if len(csv_text.splitlines()) > 18 else "")
+                + "\n```"
+            )
+        return path, f"✅ Generated citation-backed {selected_format} brief ({brief['status']}).", preview
+    except Exception as exc:
+        return None, f"❌ Could not generate the executive brief: {escape(str(exc))}", ""
+
+
+def record_current_audit_feedback(audit_ctx: Any, verdict: str, note: str = "") -> str:
+    """Save an explicit reviewer label; no policy is changed by feedback alone."""
+    ctx = audit_ctx if isinstance(audit_ctx, dict) else {}
+    audit_id = ctx.get("audit_id")
+    if not ctx.get("executed") or not audit_id:
+        return "❌ Complete an audit with database persistence before recording feedback."
+    violations = ctx.get("policy_violations") or []
+    rule_ids = [str(item.get("rule_id") or item.get("id") or "POLICY") for item in violations]
+    discrepancy = ctx.get("discrepancy") or {}
+    if not rule_ids:
+        rule_ids = ["MATCH-EXCEPTION" if discrepancy.get("detected") else "CLEAN-MATCH"]
+    try:
+        saved = [
+            overlord_db.record_audit_feedback(audit_id, rule_id, verdict, note)
+            for rule_id in dict.fromkeys(rule_ids)
+        ]
+        return (
+            f"✅ Saved {len(saved)} reviewer label(s) for audit `{audit_id}`. "
+            "The governed improvement agent only drafts changes after repeated independent feedback."
+        )
+    except Exception as exc:
+        return f"❌ Could not save feedback: {escape(str(exc))}"
+
+
+def analyze_improvement_feedback() -> tuple[str, Any]:
+    """Run the governed improvement agent and stage its unapplied draft in the policy editor."""
+    try:
+        result = analyze_feedback()
+        proposals = result["proposals"]
+        if proposals:
+            lines = ["### Evidence-Backed Recommendations"]
+            for item in proposals:
+                lines.append(f"- **{item['rule_id']} · {item['kind']}** — {item['recommendation']}")
+            lines.append(
+                "\nReview the proposed JSON in the **Raw JSON / YAML Config** editor above. "
+                "No live rule changes until you click **Apply Approved Draft & Re-Run Audit**."
+            )
+        else:
+            lines = [
+                "### No Change Proposed Yet",
+                "The agent requires at least two independent human-reviewed audits for the same rule "
+                "before drafting a severity adjustment.",
+            ]
+        lines.extend(["", f"Feedback rows analyzed: **{result['feedback_rows_analyzed']}**", result["safety_note"]])
+        draft = json.dumps(result["draft_config"], indent=2, ensure_ascii=False)
+        return "\n".join(lines), draft
+    except Exception as exc:
+        return f"❌ Improvement analysis failed safely: {escape(str(exc))}", gr.update()
+
+
+def apply_approved_improvement_draft(editor_text: str, *audit_args: Any) -> Generator[tuple[Any, ...], None, None]:
+    """Activate the human-reviewed editor draft, persist a revision, and re-run audit."""
+    try:
+        config = parse_policy_config(editor_text or "")
+        saved = save_policies(config, source="human-approved-improvement")
+    except Exception as exc:
+        yield (
+            editor_text or "",
+            f"⚠️ **Hot-Swap Rejected:** {exc}",
+            *([gr.update()] * AUDIT_OUTPUT_COUNT),
+        )
+        return
+    updated_json = json.dumps(saved, indent=2, ensure_ascii=False)
+    banner = "✅ **Approved Draft Activated:** Human-reviewed improvement draft persisted and re-audited."
+    for frame in run_audit(*audit_args, policies=saved):
         yield (updated_json, banner, *frame)
 
 
@@ -2527,11 +3074,22 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
                 '<div class="ov-status-stack">'
                 '<div class="ov-status-line"><span class="ov-dot"></span>GYANSUTR RAG : ARMED</div>'
                 '<div class="ov-status-line"><span class="ov-dot"></span>GEMINI VISION : READY</div>'
-                '<div class="ov-status-line"><span class="ov-dot ov-dot--amber"></span>LANGGRAPH : 4-NODE FSM</div>'
+                '<div class="ov-status-line"><span class="ov-dot ov-dot--amber"></span>LANGGRAPH : 5-NODE FSM</div>'
                 "</div>"
             )
+            storage_status_html = gr.HTML(value=render_storage_status_html())
             scenario_selector = gr.Dropdown(label="Demo Scenario", choices=list(SCENARIOS.keys()), value=DEFAULT_SCENARIO, interactive=True)
-            with gr.Accordion("Zero-Code Policy Hub", open=True):
+            llm_engine_selector = gr.Dropdown(
+                label="LLM Engine",
+                choices=[
+                    "Auto (Gemini → Local Ollama)",
+                    "Local Only (Ollama: Qwen 5B / OLMoE)",
+                    "Offline Deterministic",
+                ],
+                value="Auto (Gemini → Local Ollama)",
+                interactive=True,
+            )
+            with gr.Accordion("Zero-Code Policy Hub", open=False):
                 custom_rule_input = gr.Textbox(
                     label="Manual Rule Injection",
                     placeholder="e.g., Flag any setup fee over $50",
@@ -2549,7 +3107,7 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
             with gr.Column(elem_classes=["ov-chaos-wrap"]):
                 chaos_mode = gr.Checkbox(label="Chaos Mode", value=False, info="Injects adversarial Gemini Vision GR failures")
             run_btn = gr.Button("Execute 3-Way Match", elem_classes=["ov-exec-btn"])
-            gr.HTML('<div class="ov-sidebar-footer">TRACK&nbsp;&nbsp;&nbsp;PS-BA1<br>PARSER&nbsp;&nbsp;PYMUPDF + REGEX<br>VISION&nbsp;&nbsp;PIL + GEMINI 3.5<br>LEDGER&nbsp;&nbsp;FSYNC JSONL</div>')
+            gr.HTML('<div class="ov-sidebar-footer">TRACK&nbsp;&nbsp;&nbsp;PS-BA1<br>PARSER&nbsp;&nbsp;PYMUPDF + REGEX<br>VISION&nbsp;&nbsp;PIL + GEMINI 3.5<br>LEDGER&nbsp;&nbsp;SQLITE/PG + JSONL</div>')
 
         with gr.Column(scale=5, elem_classes=["ov-main"]):
             topbar_html = gr.HTML(value=render_topbar_html(recovered_amount=0.0, flash=False))
@@ -2583,6 +3141,7 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
                 with gr.Tab("Live Audit & XAI Copilot"):
                     with gr.Row(elem_classes=["overlord-row"]):
                         with gr.Column(scale=1, elem_classes=["overlord-panel-col"]):
+                            gr.HTML(render_agent_framework_html())
                             gr.HTML('<div class="ov-section-label">LangGraph Telemetry Stream</div>')
                             telemetry_log = gr.Textbox(show_label=False, value="TELEMETRY :: Awaiting 3-Way Match execution...", lines=8, max_lines=10, interactive=False, autoscroll=True, elem_classes=["ov-telemetry-box"])
                             gr.HTML('<div class="ov-section-label" style="margin-top:4px;">Explainable AI // Chat with the Auditor</div>')
@@ -2658,7 +3217,7 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
                                     )
                                     r_op = gr.Dropdown(
                                         label="Operator",
-                                        choices=[">", ">=", "<", "!=", "contains_any"],
+                                        choices=[">", ">=", "<", "<=", "==", "!=", "contains_any", "regex"],
                                         value=">",
                                         interactive=True,
                                         scale=1,
@@ -2711,6 +3270,11 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
                                         elem_classes=["ov-hotswap-btn"],
                                         scale=1,
                                     )
+                                    btn_reset_policies = gr.Button(
+                                        "↺ Reset Defaults",
+                                        elem_classes=["ov-quick-btn"],
+                                        scale=1,
+                                    )
 
                 with gr.Tab("Compliance Ledger & Export"):
                     ledger_kpi_html = gr.HTML(value=render_ledger_kpi_html())
@@ -2745,6 +3309,82 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
                                 "</div>"
                             )
                             cfo_roi_md = gr.Markdown(value=calculate_cfo_roi(5000, 600, 2.5), elem_classes=["ov-cfo-roi-card"])
+                    with gr.Row(elem_classes=["overlord-row", "ov-cfo-row"]):
+                        with gr.Column(scale=2, min_width=300, elem_classes=["overlord-panel-col", "ov-cfo-controls-card"]):
+                            gr.HTML(
+                                '<div class="ov-doc-header" style="border:1px solid #2A2D37;border-radius:6px;">'
+                                '<span class="ov-doc-title">03 / ONE-CLICK EXECUTIVE BOARDROOM BRIEF WITH CITATIONS</span>'
+                                '<span class="ov-pill ov-pill--ok">CITATIONS READY</span>'
+                                "</div>"
+                            )
+                            brief_format = gr.Radio(
+                                label="Export Format",
+                                choices=["PDF", "Markdown (.md)", "CSV"],
+                                value="PDF",
+                                interactive=True,
+                            )
+                            export_brief_btn = gr.Button("📄 Export Executive Brief", elem_classes=["ov-exec-btn"])
+                            brief_file_out = gr.File(label="Download Compiled Brief")
+                        with gr.Column(scale=3, min_width=360, elem_classes=["overlord-panel-col", "ov-cfo-bloomberg-card"]):
+                            gr.HTML(
+                                '<div class="ov-doc-header" style="border:1px solid #2A2D37;border-radius:6px;">'
+                                '<span class="ov-doc-title">04 / EXECUTIVE BRIEF PREVIEW // TOP 3 EXCEPTIONS</span>'
+                                '<span class="ov-pill">AUDIT CITATIONS</span>'
+                                "</div>"
+                            )
+                            brief_preview_md = gr.Markdown(
+                                value="Run **Execute 3-Way Match** and click **📄 Export Executive Brief** to generate a citation-backed boardroom dossier (`.pdf`, `.md`, or `.csv`).",
+                                elem_classes=["ov-cfo-roi-card"],
+                            )
+                    with gr.Accordion(
+                        "05 / GOVERNED CONTINUOUS IMPROVEMENT // HUMAN REVIEW REQUIRED",
+                        open=False,
+                        elem_classes=["ov-policy-accordion"],
+                    ):
+                        with gr.Row():
+                            improvement_verdict = gr.Dropdown(
+                                label="Review Outcome",
+                                choices=["confirmed", "false_positive", "needs_review"],
+                                value="confirmed",
+                                interactive=True,
+                                scale=1,
+                            )
+                            improvement_note = gr.Textbox(
+                                label="Reviewer Note (Optional)",
+                                placeholder="Why was this finding confirmed or a false positive?",
+                                scale=3,
+                                elem_classes=["ov-doc-editor"],
+                            )
+                            improvement_feedback_btn = gr.Button(
+                                "Save Feedback",
+                                elem_classes=["ov-quick-btn"],
+                                scale=1,
+                            )
+                        improvement_feedback_status = gr.Markdown(
+                            "Reviewer labels are hash-chained with the audit run and stored in SQL/JSONL.",
+                            elem_classes=["ov-policy-status"],
+                        )
+                        with gr.Row():
+                            improvement_analyze_btn = gr.Button(
+                                "Analyze Feedback & Draft Policy Update",
+                                elem_classes=["ov-quick-btn"],
+                                scale=2,
+                            )
+                            improvement_apply_btn = gr.Button(
+                                "Apply Approved Draft & Re-Run Audit",
+                                elem_classes=["ov-hotswap-btn"],
+                                scale=2,
+                            )
+                        improvement_analysis = gr.Markdown(
+                            "The governed learning agent waits for repeated independent human labels before drafting a policy update.",
+                            elem_classes=["ov-policy-status"],
+                        )
+                    with gr.Accordion(
+                        "06 / PRODUCT CONTROL PLANE // DETECT → PROVE → CONTROL → LEARN",
+                        open=False,
+                        elem_classes=["ov-policy-accordion"],
+                    ):
+                        gr.HTML(value=render_positioning_panel_html())
 
     # Event Wiring
     def _on_scenario_change(s: str, m: str, tax: bool):
@@ -2756,14 +3396,14 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
             render_invoice_html_from_text(sc["inv_text"], m, apply_tax=tax, flagged=False),
         )
 
-    def _on_po_upload(file_path: Optional[str]):
+    def _on_po_upload(file_path: str | None):
         try:
             text = extract_uploaded_document_text(file_path) or SCENARIOS[DEFAULT_SCENARIO]["po_text"]
         except Exception:
             text = SCENARIOS[DEFAULT_SCENARIO]["po_text"]
         return text, render_po_html_from_text(text, highlight=False)
 
-    def _on_inv_upload(file_path: Optional[str], mode: str, tax: bool):
+    def _on_inv_upload(file_path: str | None, mode: str, tax: bool):
         try:
             text = extract_uploaded_document_text(file_path) or SCENARIOS[DEFAULT_SCENARIO]["inv_text"]
         except Exception:
@@ -2782,6 +3422,7 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
     audit_mode.change(fn=lambda t, m, tax: render_invoice_html_from_text(t, m, apply_tax=tax, flagged=False), inputs=[inv_text_box, audit_mode, apply_tax_toggle], outputs=[invoice_html])
     apply_tax_toggle.change(fn=lambda t, m, tax: render_invoice_html_from_text(t, m, apply_tax=tax, flagged=False), inputs=[inv_text_box, audit_mode, apply_tax_toggle], outputs=[invoice_html])
     chaos_mode.change(fn=on_chaos_toggle, inputs=[chaos_mode], outputs=None, queue=False)
+    llm_engine_selector.change(fn=on_llm_backend_change, inputs=[llm_engine_selector], outputs=None, queue=False)
 
     audit_inputs = [
         scenario_selector, audit_mode, po_text_box, inv_text_box, gr_image,
@@ -2793,6 +3434,7 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
         auditor_chat, dispatch_banner_html, send_dispute_btn, ledger_table, ledger_kpi_html,
         gr_image, hot_swap_alert_html,
     ]
+    assert len(audit_outputs) == AUDIT_OUTPUT_COUNT
 
     run_btn.click(
         fn=run_audit,
@@ -2800,6 +3442,11 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
         outputs=audit_outputs,
         show_progress="hidden",
         concurrency_limit=1,
+    ).then(
+        fn=render_storage_status_html,
+        inputs=None,
+        outputs=[storage_status_html],
+        queue=False,
     )
     hot_swap_btn.click(
         fn=run_audit,
@@ -2807,6 +3454,11 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
         outputs=audit_outputs,
         show_progress="hidden",
         concurrency_limit=1,
+    ).then(
+        fn=render_storage_status_html,
+        inputs=None,
+        outputs=[storage_status_html],
+        queue=False,
     )
     policy_file_upload.change(
         fn=_on_policy_file_upload,
@@ -2820,6 +3472,11 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
         outputs=[policy_editor, policy_status, *audit_outputs],
         show_progress="hidden",
         concurrency_limit=1,
+    ).then(
+        fn=render_storage_status_html,
+        inputs=None,
+        outputs=[storage_status_html],
+        queue=False,
     )
     btn_hotswap_reaudit.click(
         fn=hotswap_config_and_reaudit,
@@ -2827,11 +3484,63 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
         outputs=[policy_editor, policy_status, *audit_outputs],
         show_progress="hidden",
         concurrency_limit=1,
+    ).then(
+        fn=render_storage_status_html,
+        inputs=None,
+        outputs=[storage_status_html],
+        queue=False,
+    )
+    btn_reset_policies.click(
+        fn=reset_policies_and_reaudit,
+        inputs=audit_inputs,
+        outputs=[policy_editor, policy_status, *audit_outputs],
+        show_progress="hidden",
+        concurrency_limit=1,
+    ).then(
+        fn=render_storage_status_html,
+        inputs=None,
+        outputs=[storage_status_html],
+        queue=False,
+    )
+    export_brief_btn.click(
+        fn=handle_export_executive_brief,
+        inputs=[audit_context_state, brief_format, cfo_invoices_slider, cfo_avg_val_slider, cfo_error_rate_slider],
+        outputs=[brief_file_out, brief_preview_md],
+        queue=False,
+    )
+    improvement_feedback_btn.click(
+        fn=record_current_audit_feedback,
+        inputs=[audit_context_state, improvement_verdict, improvement_note],
+        outputs=[improvement_feedback_status],
+        queue=False,
+    ).then(
+        fn=render_storage_status_html,
+        inputs=None,
+        outputs=[storage_status_html],
+        queue=False,
+    )
+    improvement_analyze_btn.click(
+        fn=analyze_improvement_feedback,
+        inputs=None,
+        outputs=[improvement_analysis, policy_editor],
+        queue=False,
+    )
+    improvement_apply_btn.click(
+        fn=apply_approved_improvement_draft,
+        inputs=[policy_editor, *audit_inputs],
+        outputs=[policy_editor, policy_status, *audit_outputs],
+        show_progress="hidden",
+        concurrency_limit=1,
+    ).then(
+        fn=render_storage_status_html,
+        inputs=None,
+        outputs=[storage_status_html],
+        queue=False,
     )
     demo.load(
-        fn=lambda: (json.dumps(load_policies(), indent=2), _format_policy_status_md()),
+        fn=lambda: (json.dumps(load_policies(), indent=2), _format_policy_status_md(), render_storage_status_html()),
         inputs=None,
-        outputs=[policy_editor, policy_status],
+        outputs=[policy_editor, policy_status, storage_status_html],
         queue=False,
     )
 

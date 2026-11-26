@@ -61,8 +61,12 @@ flowchart LR
 | **Explainable AI Chatbot** | Bottom Left (`Chat with the Auditor`) | Context-injected `gr.Chatbot` powered by Gemini 3.5 Flash with grounded offline fallback, domain guardrails (politely rejects off-topic questions like *"What is the capital of France?"*), and 4 quick-ask buttons: **Why did you flag this?**, **Summarize Invoice**, **Draft Payment Approval**, and **What if the invoice was $450?**. |
 | **Send Dispute Kill Shot** | Bottom Right (`Send Dispute to Vendor`) | Dispatches the dispute email, displays `[SUCCESS] Dispute dispatched to vendor via API. Funds secured.`, logs to JSONL, and pops up an annualized scale ROI toast (`$120,000 saved this year` at 5,000 invoices/month). |
 | **UPI Checkout Gateway** | Bottom Right (`Proceed to Payment`) | Generates a live local QR code via `qrcode` for `upi://pay?pa=9458175464@yesfam&pn=ProjectOverlord&am=500.00&cu=INR` (with raw URI fallback textbox) and a **Simulate Payment Success** button that logs `PAID ($500.00)` to the ledger. |
-| **Compliance Ledger & Export** | Tab 2 (`Compliance Ledger & Export`) | Live table backed by `workspace/receipts/overlord_audit.jsonl`, cumulative leakage KPI, and one-click JSON Audit Certificate export (`workspace/exports/OVL-CERT-*.json`). |
-| **CFO Boardroom** | Tab 3 (`CFO Boardroom`) | Bloomberg-terminal-styled ROI calculator with sliders for **Monthly Invoices Processed**, **Average Invoice Value ($)**, and **Error Rate (%)**. |
+| **Zero-Code Policy Hot-Swap** | Live Audit & Copilot (`⚡ Policy Hot-Swap`) | Add/edit JSON or YAML rules (or upload config files) via UI or MCP without code edits; forces a red **POLICY EXCEPTION — PAYMENT BLOCKED** hold even on clean matches. |
+| **Executive Boardroom Brief** | Tab 3 (`CFO Boardroom`) | One-click citation-backed **PDF, Markdown, or CSV** export ranking Top 3 urgent exceptions with exact source lines, policy rules, telemetry logs, and Supervisor/Vision math gates. |
+| **Governed Improvement Agent** | Tab 3 (`CFO Boardroom` -> Section 05) | Captures human reviewer verdicts (`confirmed`, `false_positive`, `needs_review`) in SQL and drafts policy severity updates only after repeated independent evidence (human approval required). |
+| **Multi-Tier LLM Routing** | Left Sidebar (`LLM Engine`) | Supports `Auto (Gemini -> Local Ollama)`, `Local Only (Ollama: Qwen 5B / OLMoE)` (text-only), and `Offline Deterministic` with sub-second unreachable fast-fail. |
+| **Compliance Ledger & Export** | Tab 2 (`Compliance Ledger & Export`) + Sidebar | Backed by SQLAlchemy (SQLite / PostgreSQL `DATABASE_URL`) + SHA-256 hash-chained compliance events + append-only `workspace/receipts/overlord_audit.jsonl`, plus JSON Audit Certificates. |
+| **MCP Server (`mcp_server.py`)** | `python mcp_server.py` (stdio) | Exposes 11 governed FastMCP tools sharing the live SQL database and deterministic policy engine. |
 | **Donut Challenge Hooks** | Bottom of `app.py` | Pre-built commented-out LangGraph nodes (`translate_dispute_email()`, `calculate_tax()`) ready for rapid live judging twists. |
 
 ---
@@ -71,24 +75,42 @@ flowchart LR
 
 ```text
 ZeroTouch-AP-Auditor/
-├── app.py                     # Complete application (RAG + 5-node LangGraph + Gradio 6 Obsidian UI)
-├── requirements.txt           # Runtime Python dependencies
-├── requirements-dev.txt       # Test & lint dependencies (pytest, ruff)
-├── pyproject.toml             # Project metadata, pytest & ruff configuration
-├── .env.example               # Safe template for environment variables
-├── .gitignore                 # Excludes .env, .venv, caches, and generated ledger/export artifacts
-├── run.ps1                    # Windows one-command launcher (.venv, tests, Docker)
-├── run.sh                     # macOS/Linux one-command launcher
-├── Dockerfile                 # Containerized deployment image
-├── .github/workflows/ci.yml   # GitHub Actions CI (ruff lint, offline pytest, Docker smoke test)
+├── app.py                        # Complete application (RAG + 5-node LangGraph + Gradio 6 Obsidian UI)
+├── policy_engine.py              # Deterministic hot-reloadable JSON/YAML policy parser & evaluator
+├── policies.json                 # Externalized active policy ruleset (POL-001, POL-002, ...)
+├── executive_brief.py            # Citation-backed Executive Boardroom Brief (PDF, Markdown, CSV)
+├── overlord_db.py                # SQLAlchemy ORM persistence + SHA-256 hash-chained compliance ledger
+├── mcp_server.py                 # 11-tool FastMCP stdio server sharing SQL DB & policy engine
+├── improvement_agent.py          # Governed continuous-improvement policy drafting agent
+├── requirements.txt              # Runtime Python dependencies
+├── requirements-dev.txt          # Test, lint & pitch-deck dependencies (pytest, ruff, python-pptx)
+├── pyproject.toml                # Project metadata, pytest & ruff configuration
+├── .env.example                  # Safe template for Gemini, Ollama, and DATABASE_URL variables
+├── .gitignore                    # Excludes .env, .venv, caches, SQLite DBs, and export artifacts
+├── run.ps1                       # Windows one-command launcher (.venv, tests, Docker)
+├── run.sh                        # macOS/Linux one-command launcher
+├── Dockerfile                    # Containerized deployment image
+├── .github/workflows/ci.yml      # GitHub Actions CI (ruff lint, offline pytest, Docker smoke test)
+├── scripts/
+│   └── create_pitch_deck.py      # Generator for Project_Overlord_Pitch_Deck.pptx
 ├── tests/
-│   └── test_overlord.py       # Automated test suite (dynamic parsing, PyMuPDF, XAI bot, Chaos, Mega modules)
+│   ├── test_overlord.py          # Core workflow, XAI chatbot, chaos, Policy Hot-Swap tests
+│   ├── test_donuts.py            # Donut 1 & 2 + Ollama fast-fail integration tests
+│   ├── test_policy_engine.py     # JSON/YAML validation, atomic save, clean-match override tests
+│   ├── test_executive_brief.py   # Citation-backed executive brief model & export tests
+│   ├── test_executive_brief_phase2.py # Phase 2 brief citations, ROI, & error padding tests
+│   ├── test_database_mcp.py      # SQLAlchemy persistence, SHA-256 ledger chain, & MCP tool tests
+│   └── test_improvement_agent.py # Governed feedback aggregation & non-auto-activation tests
 ├── workspace/
-│   ├── receipts/              # Immutable fsync'd JSONL audit trail (overlord_audit.jsonl)
-│   └── exports/               # Exported JSON Audit Certificates (OVL-CERT-*.json)
-├── DEMO_SCRIPT.md             # 3-minute live Broadway pitch script
-├── PITCH_DECK.md              # 4-slide Obsidian pitch deck specification & designer notes
-└── SUBMISSION.md              # Hackathon portal submission copy
+│   ├── receipts/                 # Immutable fsync'd JSONL audit trail (overlord_audit.jsonl)
+│   └── exports/                  # Exported Audit Certificates & Boardroom Briefs
+├── BUILD_OVERVIEW.md             # Architecture & product positioning guide
+├── DATABASE_AND_MCP.md           # SQL schema, PostgreSQL setup, and MCP server guide
+├── PITCH_PREP.md                 # Competition pitch timing, judge Q&A, and recovery runbook
+├── DEMO_SCRIPT.md                # 3-minute live Broadway pitch script
+├── PITCH_DECK.md                 # Obsidian pitch deck specification & designer notes
+├── Project_Overlord_Pitch_Deck.pptx # Competition slide deck
+└── SUBMISSION.md                 # Hackathon portal submission copy
 ```
 
 ---
@@ -106,6 +128,9 @@ Create `.env` from `.env.example` (`.env` is gitignored so keys are never commit
 | `GEMINI_FALLBACK_MODEL` | `gemini-3.1-flash-lite` | Automatic fallback model if the primary model errors or is unavailable. |
 | `GRADIO_SERVER_PORT` | `7860` | Web server port. |
 | `GRADIO_ANALYTICS_ENABLED` | `False` | Disables Gradio telemetry in CI/local demos. |
+| `DATABASE_URL` | *(SQLite fallback)* | Optional managed PostgreSQL connection URL (`postgres://` or `postgresql://`); defaults to local `workspace/overlord.sqlite3`. |
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Optional local Ollama endpoint for text-only fallback when Gemini is unavailable. |
+| `OVERLORD_LOCAL_MODEL` | `qwen2.5:5b` | Preferred local Ollama model (`qwen3:4b`, `qwen2.5:3b`, `olmoe:1b-7b` fallbacks supported). |
 
 ---
 
@@ -155,7 +180,14 @@ ruff check .
 
 ---
 
-## 8. Additional Project Assets
-- **3-Minute Live Pitch Script:** [DEMO_SCRIPT.md](file:///c:/Users/Lenovo/Desktop/folderAp/ZeroTouch-AP-Auditor/DEMO_SCRIPT.md)
-- **4-Slide Pitch Deck Spec:** [PITCH_DECK.md](file:///c:/Users/Lenovo/Desktop/folderAp/ZeroTouch-AP-Auditor/PITCH_DECK.md)
-- **Hackathon Portal Submission Copy:** [SUBMISSION.md](file:///c:/Users/Lenovo/Desktop/folderAp/ZeroTouch-AP-Auditor/SUBMISSION.md)
+## 8. Database, MCP Tooling & Additional Project Assets
+
+Overlord persists audit runs, rule violations, policy revisions, human reviewer feedback, and SHA-256 hash-chained compliance events via SQLAlchemy (`overlord_db.py`), while retaining the append-only JSONL receipt log. Start the optional MCP stdio server with `python mcp_server.py`. See [DATABASE_AND_MCP.md](DATABASE_AND_MCP.md) and [BUILD_OVERVIEW.md](BUILD_OVERVIEW.md) for architecture details.
+
+- **Build & Architecture Overview:** [BUILD_OVERVIEW.md](BUILD_OVERVIEW.md)
+- **Database Schema & MCP Guide:** [DATABASE_AND_MCP.md](DATABASE_AND_MCP.md)
+- **Pitch Prep, Judge Q&A & Runbook:** [PITCH_PREP.md](PITCH_PREP.md)
+- **Competition Slide Deck:** [Project_Overlord_Pitch_Deck.pptx](Project_Overlord_Pitch_Deck.pptx)
+- **3-Minute Live Pitch Script:** [DEMO_SCRIPT.md](DEMO_SCRIPT.md)
+- **Pitch Deck Spec:** [PITCH_DECK.md](PITCH_DECK.md)
+- **Hackathon Portal Submission Copy:** [SUBMISSION.md](SUBMISSION.md)
