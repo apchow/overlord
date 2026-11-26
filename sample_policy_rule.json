@@ -1,0 +1,5 @@
+{
+  "rule": "Flag any setup fee over $50 or weekend billing",
+  "severity": "HIGH",
+  "action": "HOT_SWAP_HOLD"
+}

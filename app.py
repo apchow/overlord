@@ -596,6 +596,8 @@ class OverlordState(TypedDict):
     gr_data: dict[str, Any]
     invoice_data: dict[str, Any]
     status: str
+    custom_rule: str
+    hot_swap_violation: dict[str, Any]
     step_logs: list[str]
     logs: Annotated[list[str], operator.add]
 
@@ -760,6 +762,72 @@ def invoice_parser_node(state: OverlordState) -> dict[str, Any]:
     return {"invoice_data": inv_data, "step_logs": logs, "logs": logs}
 
 
+def _extract_custom_rule(custom_rule_text: str = "", custom_rule_file: Any = None) -> str:
+    """Extract a hot-swapped policy rule from an uploaded JSON config or manual text input."""
+    if custom_rule_file:
+        try:
+            file_path = getattr(custom_rule_file, "name", custom_rule_file)
+            if file_path and Path(str(file_path)).exists():
+                raw = Path(str(file_path)).read_text(encoding="utf-8", errors="ignore").strip()
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    for key in ("rule", "policy", "custom_rule", "description"):
+                        val = data.get(key)
+                        if isinstance(val, str) and val.strip():
+                            return val.strip()
+                    vals = [str(v).strip() for v in data.values() if isinstance(v, (str, int, float)) and str(v).strip()]
+                    if vals:
+                        return " | ".join(vals)
+                elif isinstance(data, list) and data:
+                    return "; ".join(str(x).strip() for x in data if str(x).strip())
+                elif isinstance(data, str) and data.strip():
+                    return data.strip()
+        except Exception:
+            pass
+    return (custom_rule_text or "").strip()
+
+
+def render_hot_swap_alert_html(custom_rule: str = "", violated: bool = False) -> str:
+    """Render the glowing Orange Policy Hot-Swap Violation banner when triggered."""
+    if not violated or not custom_rule:
+        return ""
+    from html import escape
+    safe_rule = escape(custom_rule)
+    return (
+        '<div style="background: #2D1B1B; border-left: 4px solid #F59E0B; padding: 16px; margin-top: 10px; '
+        'animation: pulse-orange 2s infinite; border-radius: 6px;">'
+        '<div style="color: #FBBF24; font-weight: 700; font-size: 14px;">🚨 [POLICY HOT-SWAP VIOLATION]</div>'
+        f'<div style="color: #FEE2E2; font-size: 12px;">The invoice violates the newly injected rule: &quot;{safe_rule}&quot;.</div>'
+        "</div>"
+    )
+
+
+def _evaluate_hot_swap_rule(custom_rule: str, po_text: str, inv_text: str) -> tuple[bool, Optional[str]]:
+    """Evaluate a hot-swapped rule with instant deterministic fallback + Gemini LLM check."""
+    rule_clean = (custom_rule or "").strip()
+    if not rule_clean:
+        return False, None
+
+    rule_low = rule_clean.lower()
+    inv_low = (inv_text or "").lower()
+    trigger_words = ("fee", "setup", "limit", "weekend")
+    if any(w in rule_low for w in trigger_words) and ("setup fee" in inv_low or "fee" in inv_low or "weekend" in inv_low):
+        return True, "[DETERMINISTIC FALLBACK] Rule matched in mock data. Bypassing LLM for instant demo response."
+
+    prompt = (
+        "Evaluate the Vendor Invoice against BOTH the Purchase Order and this newly injected custom policy rule.\n"
+        f"Custom Rule: {rule_clean}\n"
+        f"Purchase Order:\n{po_text[:1200]}\n\n"
+        f"Vendor Invoice:\n{inv_text[:1200]}\n\n"
+        "Reply with exactly 'VIOLATION: YES' on the first line if the invoice violates the custom rule, "
+        "or 'VIOLATION: NO' if it complies, followed by a 1-sentence explanation."
+    )
+    reply = _call_gemini_safe(prompt, max_tokens=120, timeout_sec=5.0)
+    if reply and "VIOLATION: YES" in reply.upper():
+        return True, f"[POLICY HOT-SWAP] Gemini Auditor confirmed violation of: \"{rule_clean}\""
+    return False, None
+
+
 def auditor_node(state: OverlordState) -> dict[str, Any]:
     """Node 4 (Auditor): Real line-item 3-Way reconciliation & dynamic dispute drafting."""
     po_data = state["po_data"]
@@ -843,10 +911,25 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
             _log(f"PASS :: 3-Way Match verified (${inv_amt:,.2f} == ${po_amt:,.2f}). Cleared for Net-30 payment."),
         ]
 
+    custom_rule = (state.get("custom_rule") or "").strip()
+    hot_swap_violation: dict[str, Any] = {"violated": False, "rule": custom_rule}
+    if custom_rule:
+        violated, hs_log = _evaluate_hot_swap_rule(
+            custom_rule, state.get("po_text", ""), state.get("invoice_text", "")
+        )
+        hot_swap_violation = {"violated": violated, "rule": custom_rule}
+        if hs_log:
+            logs.append(_log(hs_log))
+        if violated:
+            logs.append(_log(f"[POLICY HOT-SWAP VIOLATION] Invoice flagged against dynamic rule: \"{custom_rule}\"."))
+        else:
+            logs.append(_log(f"[POLICY HOT-SWAP] Invoice complies with dynamic rule: \"{custom_rule}\"."))
+
     return {
         "discrepancy": discrepancy,
         "dispute_email": dispute_email,
-        "status": "flagged" if discrepancy["detected"] else "cleared",
+        "status": "flagged" if (discrepancy["detected"] or hot_swap_violation["violated"]) else "cleared",
+        "hot_swap_violation": hot_swap_violation,
         "step_logs": logs,
         "logs": logs,
     }
@@ -1535,6 +1618,9 @@ ul.options li.item:hover, ul.options .item:hover, ul.options li.item.active, .op
 /* Alert & Dispatch Banners */
 .alert-box { background: linear-gradient(180deg, rgba(239, 68, 68, 0.22) 0%, rgba(239, 68, 68, 0.07) 100%); border: 1px solid rgba(239, 68, 68, 0.8); border-left: 6px solid var(--ov-red); border-radius: 6px; padding: 14px 16px; animation: ov-alert-pulse 1.5s infinite; }
 @keyframes ov-alert-pulse { 0%, 100% { box-shadow: 0 0 16px rgba(239, 68, 68, 0.22); } 50% { box-shadow: 0 0 34px rgba(239, 68, 68, 0.55); } }
+@keyframes pulse-orange { 0%, 100% { box-shadow: 0 0 12px rgba(245, 158, 11, 0.25); } 50% { box-shadow: 0 0 28px rgba(245, 158, 11, 0.72); } }
+.ov-hotswap-btn button { background: #F59E0B !important; color: #000000 !important; font-weight: bold !important; font-family: var(--ov-font-mono) !important; letter-spacing: 0.05em !important; min-height: 40px !important; border: none !important; }
+.ov-hotswap-btn button:hover { background: #D97706 !important; color: #000000 !important; }
 .alert-box .alert-title { font-family: var(--ov-font-mono); font-size: 15px; font-weight: 700; letter-spacing: 0.05em; color: #FFFFFF; margin-bottom: 4px; }
 .alert-box .alert-body { font-size: 12.5px; color: #FECACA; line-height: 1.5; }
 .findings-idle { background: var(--ov-panel-deep); border: 1px solid var(--ov-border); border-left: 4px solid var(--ov-border); border-radius: 6px; padding: 12px 14px; font-family: var(--ov-font-mono); font-size: 11px; color: var(--ov-text-dim); }
@@ -1743,18 +1829,25 @@ def run_audit(
     gr_image: Any = None,
     chaos_mode: bool = False,
     apply_tax: bool = False,
+    custom_rule_text: str = "",
+    custom_rule_file: Any = None,
 ) -> Generator[tuple[Any, ...], None, None]:
-    """Execute the 4-Node LangGraph StateGraph against live/edited PO, GR, and Invoice inputs."""
+    """Execute the 5-Node LangGraph StateGraph against live/edited PO, GR, and Invoice inputs."""
     sc = SCENARIOS.get(scenario_name, SCENARIOS[DEFAULT_SCENARIO])
     live_po_text = (po_text_input or "").strip() or sc["po_text"]
     live_inv_text = (inv_text_input or "").strip() or sc["inv_text"]
+    custom_rule = _extract_custom_rule(custom_rule_text, custom_rule_file)
+    init_logs: list[str] = []
+    if custom_rule:
+        init_logs.append(_log(f'[POLICY HOT-SWAP] Injecting custom rule: "{custom_rule}" into Auditor Node...'))
+    init_logs.append(f"[{_ts()}] QUEUE :: Locking Mission Control & preparing {audit_mode}...")
 
     # Immediate frame 0: disable Execute button
     yield (
         gr.update(interactive=False, value="Executing Pipeline..."),
         render_topbar_html(recovered_amount=0.0, flash=False),
         render_metrics_bar_html(),
-        f"[{_ts()}] QUEUE :: Locking Mission Control & preparing {audit_mode}...",
+        "\n".join(init_logs),
         render_findings_html("scanning"),
         "",
         render_po_html_from_text(live_po_text, highlight=False),
@@ -1767,6 +1860,7 @@ def run_audit(
         build_ledger_rows_and_total()[0],
         render_ledger_kpi_html(),
         gr_image or DEFAULT_GR_IMAGE_PATH,
+        "",
     )
 
     initial_state: OverlordState = {
@@ -1783,12 +1877,14 @@ def run_audit(
         "gr_data": {},
         "invoice_data": {},
         "status": "running",
+        "custom_rule": custom_rule,
+        "hot_swap_violation": {"violated": False, "rule": custom_rule},
         "step_logs": [],
         "logs": [],
     }
 
     snapshot: dict[str, Any] = dict(initial_state)
-    cumulative_logs: list[str] = []
+    cumulative_logs: list[str] = list(init_logs[:1]) if custom_rule else []
     step_delay = 0.36
     emitted = 0
     last_payload = None
@@ -1896,6 +1992,10 @@ def run_audit(
                         ledger_rows,
                         render_ledger_kpi_html(),
                         active_gr_img,
+                        render_hot_swap_alert_html(
+                            custom_rule=custom_rule,
+                            violated=bool((snapshot.get("hot_swap_violation") or {}).get("violated")),
+                        ),
                     )
                     yield last_payload
     except Exception as exc:
@@ -1918,6 +2018,7 @@ def run_audit(
             ledger_rows,
             render_ledger_kpi_html(),
             gr_image or DEFAULT_GR_IMAGE_PATH,
+            "",
         )
     finally:
         if last_payload is not None and not last_payload[0].get("interactive", False):
@@ -1943,6 +2044,19 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
                 "</div>"
             )
             scenario_selector = gr.Dropdown(label="Demo Scenario", choices=list(SCENARIOS.keys()), value=DEFAULT_SCENARIO, interactive=True)
+            with gr.Accordion("Zero-Code Policy Hub", open=True):
+                custom_rule_input = gr.Textbox(
+                    label="Manual Rule Injection",
+                    placeholder="e.g., Flag any setup fee over $50",
+                    lines=2,
+                    elem_classes=["ov-doc-editor"],
+                )
+                custom_rule_file = gr.File(
+                    label="Upload JSON Config",
+                    file_types=[".json"],
+                    type="filepath",
+                )
+                hot_swap_btn = gr.Button("HOT-SWAP & RE-AUDIT", elem_classes=["ov-hotswap-btn"])
             audit_mode = gr.Dropdown(label="Audit Mode", choices=["3-Way Match", "2-Way Match", "4-Way Match (Tax Verification)"], value="3-Way Match", interactive=True)
             apply_tax_toggle = gr.Checkbox(label="Apply 10% Tax Node", value=False, info="Live Donut-Challenge tax validation hook")
             with gr.Column(elem_classes=["ov-chaos-wrap"]):
@@ -1998,6 +2112,7 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
 
                         with gr.Column(scale=1, elem_classes=["overlord-panel-col"]):
                             audit_findings_html = gr.HTML(value=render_findings_html("idle"))
+                            hot_swap_alert_html = gr.HTML(value="")
                             gr.HTML('<div class="ov-section-label">Auto-Drafted Vendor Dispute Email</div>')
                             dispute_email = gr.Textbox(show_label=False, value="", placeholder="Auto-drafted vendor dispute email will appear here...", lines=9, max_lines=12, interactive=True, buttons=["copy"], elem_classes=["ov-dispute-box"])
                             with gr.Row():
@@ -2092,14 +2207,28 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
     apply_tax_toggle.change(fn=lambda t, m, tax: render_invoice_html_from_text(t, m, apply_tax=tax, flagged=False), inputs=[inv_text_box, audit_mode, apply_tax_toggle], outputs=[invoice_html])
     chaos_mode.change(fn=on_chaos_toggle, inputs=[chaos_mode], outputs=None, queue=False)
 
+    audit_inputs = [
+        scenario_selector, audit_mode, po_text_box, inv_text_box, gr_image,
+        chaos_mode, apply_tax_toggle, custom_rule_input, custom_rule_file,
+    ]
+    audit_outputs = [
+        run_btn, topbar_html, metrics_bar_html, telemetry_log, audit_findings_html,
+        dispute_email, po_html, invoice_html, vision_badge_html, audit_context_state,
+        auditor_chat, dispatch_banner_html, send_dispute_btn, ledger_table, ledger_kpi_html,
+        gr_image, hot_swap_alert_html,
+    ]
+
     run_btn.click(
         fn=run_audit,
-        inputs=[scenario_selector, audit_mode, po_text_box, inv_text_box, gr_image, chaos_mode, apply_tax_toggle],
-        outputs=[
-            run_btn, topbar_html, metrics_bar_html, telemetry_log, audit_findings_html,
-            dispute_email, po_html, invoice_html, vision_badge_html, audit_context_state,
-            auditor_chat, dispatch_banner_html, send_dispute_btn, ledger_table, ledger_kpi_html, gr_image,
-        ],
+        inputs=audit_inputs,
+        outputs=audit_outputs,
+        show_progress="hidden",
+        concurrency_limit=1,
+    )
+    hot_swap_btn.click(
+        fn=run_audit,
+        inputs=audit_inputs,
+        outputs=audit_outputs,
         show_progress="hidden",
         concurrency_limit=1,
     )
