@@ -130,3 +130,54 @@ def test_mega_update_modules():
     app.gr.Info = lambda msg: toasts.append(msg)
     app.send_dispute_to_vendor(steps_a[-1][5], steps_a[-1][9])
     assert any("Dispute sent. You just saved $100. At your current scale, this amounts to $120,000 saved this year." in t for t in toasts)
+
+
+def test_zero_code_policy_engine_hot_swap():
+    import policy_engine
+
+    original_policies = policy_engine.load_policies()
+    scenario_c = "Scenario C: Clean 3-Way Match ($0.00 Variance)"
+    try:
+        # 1. Baseline Scenario C passes cleanly under default POL-001 / POL-002
+        clean_steps = list(app.run_audit(scenario_c, "3-Way Match"))
+        clean_last = clean_steps[-1]
+        assert not clean_last[9].get("policy_violations")
+        assert "3-WAY MATCH VERIFIED: CLEARED FOR PAYMENT" in clean_last[4]
+
+        # 2. Live Quick Rule Builder hot-swap: invoice_total > 400 -> BLOCK_PAYMENT flips Scenario C!
+        hs_steps = list(
+            app.add_rule_and_reaudit(
+                "Cap Over 400",
+                "invoice_total",
+                ">",
+                "400",
+                "CRITICAL",
+                "BLOCK_PAYMENT",
+                scenario_c,
+                "3-Way Match",
+            )
+        )
+        updated_json, banner, *audit_last = hs_steps[-1]
+        assert "POL-003" in updated_json
+        assert "Hot-Swapped Rule `POL-003`" in banner
+        assert "[POLICY ENGINE // CRITICAL] POL-003" in audit_last[3]
+        assert "DISCREPANCY DETECTED" in audit_last[4]
+        assert "[POLICY ENGINE VIOLATION]" in audit_last[16]
+
+        # 3. YAML config hot-swap parses & applies cleanly
+        yaml_cfg = (
+            "- id: POL-YAML-1\n"
+            "  name: Block CloudScale Vendor\n"
+            "  field: vendor_name\n"
+            "  operator: contains_any\n"
+            "  value: [cloudscale]\n"
+            "  severity: HIGH\n"
+            "  action: FLAG_CFO_REVIEW\n"
+            "  active: true\n"
+        )
+        rules, msg = policy_engine.parse_policy_text(yaml_cfg)
+        assert len(rules) == 1 and "YAML" in msg
+        hits = policy_engine.evaluate_policies({"vendor_name": "CloudScale Security Corp."}, rules)
+        assert len(hits) == 1 and hits[0]["id"] == "POL-YAML-1"
+    finally:
+        policy_engine.save_policies(original_policies)

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "POL-001",
+    "name": "No Unauthorized Setup/Onboarding Fees",
+    "field": "invoice_text",
+    "operator": "contains_any",
+    "value": [
+      "setup fee",
+      "onboarding retainer",
+      "misc surcharge"
+    ],
+    "severity": "CRITICAL",
+    "action": "BLOCK_PAYMENT",
+    "active": true
+  },
+  {
+    "id": "POL-002",
+    "name": "Max Invoice Cap Without CFO Sign-off",
+    "field": "invoice_total",
+    "operator": ">",
+    "value": 5000,
+    "severity": "HIGH",
+    "action": "FLAG_CFO_REVIEW",
+    "active": true
+  }
+]

@@ -22,7 +22,7 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-COPY app.py ./
+COPY app.py policy_engine.py policies.json sample_policy_rule.json ./
 COPY tests ./tests
 
 # Runtime artefacts (ledger + certificates) live here; mount a volume to persist.

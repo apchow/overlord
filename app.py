@@ -42,6 +42,13 @@ from google.genai import types
 from langgraph.graph import END, START, StateGraph
 from PIL import Image, ImageDraw
 
+from policy_engine import (
+    evaluate_policies,
+    load_policies,
+    parse_policy_text,
+    save_policies,
+)
+
 load_dotenv()
 
 
@@ -598,6 +605,8 @@ class OverlordState(TypedDict):
     status: str
     custom_rule: str
     hot_swap_violation: dict[str, Any]
+    policies: Optional[list[dict[str, Any]]]
+    policy_violations: list[dict[str, Any]]
     step_logs: list[str]
     logs: Annotated[list[str], operator.add]
 
@@ -787,18 +796,64 @@ def _extract_custom_rule(custom_rule_text: str = "", custom_rule_file: Any = Non
     return (custom_rule_text or "").strip()
 
 
-def render_hot_swap_alert_html(custom_rule: str = "", violated: bool = False) -> str:
-    """Render the glowing Orange Policy Hot-Swap Violation banner when triggered."""
-    if not violated or not custom_rule:
+def _format_violation_line(v: dict[str, Any]) -> str:
+    """Format a single policy_engine violation consistently for logs, emails, and alerts."""
+    rid = str(v.get("id") or v.get("rule_id") or "POL")
+    rname = str(v.get("name") or v.get("rule_name") or "Policy Rule")
+    sev = str(v.get("severity") or "HIGH")
+    act = str(v.get("action") or "FLAG_REVIEW")
+    rsn = str(v.get("reason") or "")
+    prefix = f"{rid} ({rname}):"
+    if rsn.startswith(prefix):
+        return f"[POLICY ENGINE // {sev}] {rsn} -> {act}"
+    return f"[POLICY ENGINE // {sev}] {rid} ({rname}): {rsn} -> {act}"
+
+
+def render_hot_swap_alert_html(
+    custom_rule: str = "",
+    violated: bool = False,
+    policy_violations: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    """Render the glowing Orange Policy Hot-Swap / Policy Engine Violation banner when triggered."""
+    violations = policy_violations or []
+    if not violations and (not violated or not custom_rule):
         return ""
-    from html import escape
-    safe_rule = escape(custom_rule)
+
+    rows_html: list[str] = []
+    for v in violations:
+        rid = escape(str(v.get("id") or v.get("rule_id") or "POL"))
+        rname = escape(str(v.get("name") or v.get("rule_name") or "Policy Rule"))
+        sev = escape(str(v.get("severity") or "HIGH"))
+        act = escape(str(v.get("action") or "FLAG_REVIEW"))
+        raw_reason = str(v.get("reason") or "")
+        raw_prefix = f"{v.get('id') or v.get('rule_id') or 'POL'} ({v.get('name') or v.get('rule_name') or 'Policy Rule'}):"
+        detail = raw_reason[len(raw_prefix):].strip() if raw_reason.startswith(raw_prefix) else raw_reason
+        safe_detail = escape(detail or "Policy threshold exceeded")
+        rows_html.append(
+            '<div style="color: #FEE2E2; font-size: 12px; margin-top: 5px; line-height: 1.45;">'
+            f'<span style="color: #FBBF24; font-weight: 700;">[{sev}] {rid} ({rname})</span>: '
+            f'{safe_detail} <span style="color: #FCD34D; font-weight: 700;">&rarr; {act}</span>'
+            "</div>"
+        )
+
+    if violated and custom_rule:
+        safe_rule = escape(custom_rule)
+        rows_html.append(
+            f'<div style="color: #FEE2E2; font-size: 12px; margin-top: 5px;">'
+            f'The invoice violates the newly injected rule: &quot;{safe_rule}&quot;.</div>'
+        )
+
+    title = (
+        "🚨 [POLICY HOT-SWAP VIOLATION]"
+        if (violated and custom_rule)
+        else "🚨 [POLICY ENGINE VIOLATION]"
+    )
     return (
-        '<div style="background: #2D1B1B; border-left: 4px solid #F59E0B; padding: 16px; margin-top: 10px; '
+        '<div style="background: #2D1B1B; border-left: 4px solid #F59E0B; padding: 14px 16px; margin-top: 10px; '
         'animation: pulse-orange 2s infinite; border-radius: 6px;">'
-        '<div style="color: #FBBF24; font-weight: 700; font-size: 14px;">🚨 [POLICY HOT-SWAP VIOLATION]</div>'
-        f'<div style="color: #FEE2E2; font-size: 12px;">The invoice violates the newly injected rule: &quot;{safe_rule}&quot;.</div>'
-        "</div>"
+        f'<div style="color: #FBBF24; font-weight: 700; font-size: 14px;">{title}</div>'
+        + "".join(rows_html)
+        + "</div>"
     )
 
 
@@ -822,14 +877,14 @@ def _evaluate_hot_swap_rule(custom_rule: str, po_text: str, inv_text: str) -> tu
         "Reply with exactly 'VIOLATION: YES' on the first line if the invoice violates the custom rule, "
         "or 'VIOLATION: NO' if it complies, followed by a 1-sentence explanation."
     )
-    reply = _call_gemini_safe(prompt, max_tokens=120, timeout_sec=5.0)
+    reply = _call_gemini_safe(prompt, max_wait_s=5.0)
     if reply and "VIOLATION: YES" in reply.upper():
         return True, f"[POLICY HOT-SWAP] Gemini Auditor confirmed violation of: \"{rule_clean}\""
     return False, None
 
 
 def auditor_node(state: OverlordState) -> dict[str, Any]:
-    """Node 4 (Auditor): Real line-item 3-Way reconciliation & dynamic dispute drafting."""
+    """Node 4 (Auditor): Real line-item 3-Way reconciliation, Policy Engine & dynamic dispute drafting."""
     po_data = state["po_data"]
     gr_data = state["gr_data"]
     inv_data = state["invoice_data"]
@@ -844,6 +899,34 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
     variance = discrepancy["variance"]
     extra_label = discrepancy["primary_extra_label"]
     chaos_hit = discrepancy["chaos_triggered"]
+
+    active_policies = state.get("policies") or load_policies()
+    sc = SCENARIOS.get(state.get("scenario_name", ""), {})
+    gr_delivered = int(sc.get("gr_delivered_qty", 1) or 1)
+    gr_expected = int(sc.get("gr_expected_qty", gr_delivered) or gr_delivered)
+    policy_context: dict[str, Any] = {
+        "po_total": float(po_amt),
+        "invoice_total": float(inv_amt),
+        "variance": float(abs(inv_amt - po_amt)),
+        "tax_pct": 10.0 if state.get("apply_tax") else 0.0,
+        "short_shipped_units": max(0, int(gr_expected - gr_delivered)),
+        "invoice_text": str(state.get("invoice_text", "")),
+        "vendor_name": str(vendor),
+    }
+    policy_violations = evaluate_policies(policy_context, active_policies)
+    discrepancy["policy_violations"] = policy_violations
+
+    policy_triggered_only = bool(policy_violations) and not discrepancy["detected"]
+    if policy_triggered_only:
+        discrepancy["detected"] = True
+        discrepancy["policy_triggered"] = True
+        if any(str(v.get("action", "")).upper() == "BLOCK_PAYMENT" for v in policy_violations):
+            discrepancy["recovered"] = round(max(float(discrepancy.get("recovered", 0.0)), float(inv_amt)), 2)
+
+    policy_summary_block = "\n".join(
+        f"  - [{v.get('severity', 'HIGH')}] {v.get('reason', '')} -> {v.get('action', 'FLAG_REVIEW')}"
+        for v in policy_violations
+    )
 
     if chaos_hit:
         reason = (
@@ -860,14 +943,33 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
             f"Payment is placed on SHORT-PAYMENT HOLD (${discrepancy['recovered']:,.2f} protected) pending valid proof of delivery.\n\n"
             f"Regards,\nAccounts Payable // Project Overlord"
         )
+    elif policy_triggered_only:
+        reason = "; ".join(
+            str(v.get("reason") or f"{v.get('id', 'POL')} ({v.get('name', 'Policy Rule')})")
+            for v in policy_violations
+        )
+        actions_str = ", ".join(
+            dict.fromkeys(str(v.get("action") or "FLAG_REVIEW") for v in policy_violations)
+        )
+        dispute_email = (
+            f"Subject: POLICY EXCEPTION ({actions_str}) - {inv_id} (Ref: {po_id})\n\n"
+            f"Dear {vendor} Billing Team,\n\n"
+            f"Our automated {audit_mode} Policy Engine has flagged Invoice {inv_id} "
+            f"(${inv_amt:,.2f} against {po_id} authorized ${po_amt:,.2f}) for violating active enterprise rules:\n"
+            f"{policy_summary_block}\n\n"
+            f"Enforcement Action: {actions_str}. Payment is withheld pending compliance resolution.\n\n"
+            f"Regards,\nAccounts Payable // Project Overlord"
+        )
     elif discrepancy["detected"]:
         reason = f"Invoice exceeds authorized {po_id} amount. Vendor added unauthorized \"{extra_label}\"."
+        policy_note = f"\nTriggered Enterprise Policies:\n{policy_summary_block}\n" if policy_violations else ""
         dispute_email = (
             f"Subject: Dispute - Invoice {inv_id} (Ref: {po_id})\n\n"
             f"Dear {vendor} Billing Team,\n\n"
             f"Our automated {audit_mode} has flagged Invoice {inv_id}. "
             f"The billed amount (${inv_amt:,.2f}) exceeds the authorized {po_id} amount "
-            f"(${po_amt:,.2f}) by ${variance:,.2f} for an unauthorized \"{extra_label}\".\n\n"
+            f"(${po_amt:,.2f}) by ${variance:,.2f} for an unauthorized \"{extra_label}\".\n"
+            f"{policy_note}\n"
             f"Payment is on hold pending a corrected invoice for ${po_amt:,.2f}.\n\n"
             f"Regards,\nAccounts Payable // Project Overlord"
         )
@@ -887,19 +989,22 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
         "invoice_billed": inv_amt,
         "variance": variance,
         "recovered": discrepancy["recovered"],
+        "policy_violations": [str(v.get("id") or v.get("rule_id") or "") for v in policy_violations],
         "status": "FLAGGED" if discrepancy["detected"] else "CLEARED",
     })
 
     if discrepancy["detected"]:
-        flag_msg = (
-            f"FLAG :: CHAOS VISION EXCEPTION + ${variance:,.2f} variance! Short-payment initiated."
-            if (chaos_hit and variance > 0)
-            else (
-                f"FLAG :: {gr_data['vision_summary']}"
-                if chaos_hit
-                else f"FLAG :: Discrepancy detected! Invoice (${inv_amt:,.2f}) exceeds PO (${po_amt:,.2f}) by ${variance:,.2f}."
+        if chaos_hit and variance > 0:
+            flag_msg = f"FLAG :: CHAOS VISION EXCEPTION + ${variance:,.2f} variance! Short-payment initiated."
+        elif chaos_hit:
+            flag_msg = f"FLAG :: {gr_data['vision_summary']}"
+        elif policy_triggered_only:
+            actions_str = ", ".join(
+                dict.fromkeys(str(v.get("action") or "FLAG_REVIEW") for v in policy_violations)
             )
-        )
+            flag_msg = f"FLAG :: Policy Engine exception ({actions_str}) triggered on {inv_id} (${inv_amt:,.2f})."
+        else:
+            flag_msg = f"FLAG :: Discrepancy detected! Invoice (${inv_amt:,.2f}) exceeds PO (${po_amt:,.2f}) by ${variance:,.2f}."
         logs = [
             _log(f"[STATE: AUDIT] -> Node 4: Cross-referencing PO, GR, and Invoice ({audit_mode})..."),
             _log(flag_msg),
@@ -910,6 +1015,9 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
             _log(f"[STATE: AUDIT] -> Node 4: Cross-referencing PO, GR, and Invoice ({audit_mode})..."),
             _log(f"PASS :: 3-Way Match verified (${inv_amt:,.2f} == ${po_amt:,.2f}). Cleared for Net-30 payment."),
         ]
+
+    for v in policy_violations:
+        logs.append(_log(_format_violation_line(v)))
 
     custom_rule = (state.get("custom_rule") or "").strip()
     hot_swap_violation: dict[str, Any] = {"violated": False, "rule": custom_rule}
@@ -930,6 +1038,7 @@ def auditor_node(state: OverlordState) -> dict[str, Any]:
         "dispute_email": dispute_email,
         "status": "flagged" if (discrepancy["detected"] or hot_swap_violation["violated"]) else "cleared",
         "hot_swap_violation": hot_swap_violation,
+        "policy_violations": policy_violations,
         "step_logs": logs,
         "logs": logs,
     }
@@ -941,6 +1050,7 @@ def supervisor_node(state: OverlordState) -> dict[str, Any]:
     po_amt = float(disc.get("po_authorized", 500.0))
     inv_amt = float(disc.get("invoice_billed", 600.0))
     var_amt = float(disc.get("variance", round(inv_amt - po_amt, 2)))
+    p_violations = disc.get("policy_violations") or state.get("policy_violations") or []
 
     def _fmt(val: float) -> str:
         return str(int(val)) if val.is_integer() else f"{val:.2f}"
@@ -953,10 +1063,25 @@ def supervisor_node(state: OverlordState) -> dict[str, Any]:
                 "Calculations mathematically verified. Routing to Dispute."
             ),
         ]
-    elif disc.get("detected"):
+    elif disc.get("detected") and disc.get("chaos_triggered"):
         logs = [
             _log("[SUPERVISOR AGENT] Verifying Vision compliance exception..."),
             _log("[SUPERVISOR AGENT] Vision short-payment hold verified. Routing to Dispute."),
+        ]
+    elif disc.get("detected") and p_violations:
+        rule_ids = ", ".join(str(v.get("id") or v.get("rule_id") or "POL") for v in p_violations)
+        actions = ", ".join(dict.fromkeys(str(v.get("action") or "FLAG_REVIEW") for v in p_violations))
+        logs = [
+            _log(f"[SUPERVISOR AGENT] Verifying Policy Engine exception ({rule_ids})..."),
+            _log(
+                f"[SUPERVISOR AGENT] Math verified ({_fmt(inv_amt)} - {_fmt(po_amt)} = 0); "
+                f"policy violation confirmed ({actions}). Routing to Dispute."
+            ),
+        ]
+    elif disc.get("detected"):
+        logs = [
+            _log("[SUPERVISOR AGENT] Verifying compliance exception..."),
+            _log("[SUPERVISOR AGENT] Exception hold verified. Routing to Dispute."),
         ]
     else:
         logs = [
@@ -1064,7 +1189,7 @@ def _build_xai_fallback_reply(
         "consulting", "vendor", "dispute", "email", "hold", "payment", "match",
         "3-way", "2-way", "4-way", "tax", "summary", "summarize", "about", "memo",
         "approve", "status", "total", "recovered", "po", "gr", "receipt", "vision",
-        "chaos", "price", "rate", "cost", "450", "pass", "fail", "what",
+        "chaos", "price", "rate", "cost", "450", "pass", "fail", "what", "policy", "policies",
     )
     if not any(re.search(rf"\b{re.escape(k)}\b", msg) for k in domain_keywords):
         return (
@@ -1084,6 +1209,15 @@ def _build_xai_fallback_reply(
             f"The Purchase Order ({po_id}) authorized a flat fee of ${po_amt:,.2f}. "
             f"The Vendor Invoice ({inv_id}) billed ${inv_amt:,.2f}, citing an unauthorized '{extra_label}'. "
             f"Therefore, an overcharge of ${variance:,.2f} was detected."
+        )
+
+    p_viol = audit_ctx.get("policy_violations") or []
+    if p_viol:
+        summary_rules = "; ".join(str(v.get("reason") or v.get("id") or "Policy violation") for v in p_viol)
+        return (
+            f"**Policy Engine Violation Triggered:** {summary_rules}. "
+            f"Invoice `{inv_id}` (`${inv_amt:,.2f}`) against `{po_id}` (`${po_amt:,.2f}`) was flagged "
+            f"(protected: `${audit_ctx.get('recovered', 0.0):,.2f}`)."
         )
 
     return (
@@ -1630,6 +1764,112 @@ ul.options li.item:hover, ul.options .item:hover, ul.options li.item.active, .op
 .ov-dispatch-success { background: linear-gradient(180deg, rgba(16, 185, 129, 0.20) 0%, rgba(16, 185, 129, 0.07) 100%); border: 1px solid var(--ov-green); border-left: 5px solid var(--ov-green); border-radius: 6px; padding: 10px 14px; box-shadow: 0 0 22px rgba(16, 185, 129, 0.25); }
 .ov-dispatch-title { font-family: var(--ov-font-mono); font-size: 12px; font-weight: 700; color: #ECFDF5; }
 .ov-dispatch-sub { font-family: var(--ov-font-mono); font-size: 10px; color: #A7F3D0; margin-top: 3px; }
+
+/* Zero-Code Policy Hot-Swap Accordion & CodeMirror 6 Obsidian Dark Overrides */
+.ov-policy-accordion,
+.ov-policy-accordion > .wrap,
+.ov-policy-accordion .accordion,
+.gradio-container .accordion,
+.gradio-container [data-testid="accordion"] {
+    background-color: var(--ov-panel) !important;
+    border: 1px solid var(--ov-border) !important;
+    border-radius: 6px !important;
+    color: var(--ov-text) !important;
+}
+.ov-policy-accordion > button.label-wrap,
+.gradio-container .accordion > button.label-wrap,
+.gradio-container [data-testid="accordion"] > button {
+    background-color: #151822 !important;
+    color: var(--ov-text-bright) !important;
+    border-bottom: 1px solid var(--ov-border) !important;
+    font-family: var(--ov-font-mono) !important;
+    font-size: 12px !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.06em !important;
+    padding: 10px 14px !important;
+}
+.ov-policy-accordion > button.label-wrap span,
+.gradio-container .accordion > button.label-wrap span,
+.gradio-container .accordion > button.label-wrap .icon,
+.gradio-container [data-testid="accordion"] > button svg {
+    color: #FBBF24 !important;
+    fill: #FBBF24 !important;
+    background: transparent !important;
+}
+.ov-policy-status,
+.ov-policy-status .prose,
+.ov-policy-status .md {
+    background-color: var(--ov-panel-deep) !important;
+    border: 1px solid var(--ov-border) !important;
+    border-left: 3px solid #F59E0B !important;
+    border-radius: 6px !important;
+    padding: 8px 12px !important;
+    color: var(--ov-text) !important;
+    font-size: 12px !important;
+}
+.ov-policy-status .prose,
+.ov-policy-status .md {
+    border: none !important;
+    padding: 0 !important;
+    background: transparent !important;
+}
+.ov-policy-status code {
+    background-color: rgba(245, 158, 11, 0.14) !important;
+    color: #FCD34D !important;
+    border: 1px solid rgba(245, 158, 11, 0.35) !important;
+    border-radius: 4px !important;
+    padding: 1px 6px !important;
+    font-family: var(--ov-font-mono) !important;
+}
+.ov-policy-form-row { align-items: flex-end !important; }
+.gradio-container .cm-editor,
+.gradio-container .cm-scroller,
+.gradio-container .cm-content,
+.gradio-container [data-testid="code"],
+.gradio-container [data-testid="code"] .wrap,
+.ov-policy-code,
+.ov-policy-code .wrap {
+    background-color: #0D0F14 !important;
+    color: #E7E9EE !important;
+    font-family: var(--ov-font-mono) !important;
+    font-size: 12px !important;
+    color-scheme: dark !important;
+}
+.gradio-container .cm-editor {
+    border: 1px solid var(--ov-border) !important;
+    border-radius: 6px !important;
+}
+.gradio-container .cm-editor.cm-focused {
+    outline: none !important;
+    border-color: #F59E0B !important;
+}
+.gradio-container .cm-gutters,
+.gradio-container .cm-gutter {
+    background-color: #12141A !important;
+    color: #6B7280 !important;
+    border-right: 1px solid var(--ov-border) !important;
+}
+.gradio-container .cm-activeLineGutter,
+.gradio-container .cm-activeLine {
+    background-color: rgba(245, 158, 11, 0.08) !important;
+}
+.gradio-container .cm-cursor,
+.gradio-container .cm-dropCursor {
+    border-left-color: #34D399 !important;
+}
+.gradio-container .cm-selectionBackground,
+.gradio-container .cm-content ::selection {
+    background-color: rgba(16, 185, 129, 0.25) !important;
+}
+.ov-policy-code .cm-line,
+.ov-policy-code .cm-line span {
+    color: #A7F3D0 !important;
+}
+.gradio-container [data-testid="code"] button {
+    background-color: var(--ov-panel-elevated) !important;
+    border: 1px solid var(--ov-border) !important;
+    color: var(--ov-text-muted) !important;
+}
 """
 
 
@@ -1780,23 +2020,34 @@ def render_vision_badge_html(confidence: str = "99.4%", detail: str = "1 Item De
     return f'<div class="{cls}"><span>Vision AI Confidence: {escape(confidence)}</span><span class="sub">{escape(detail)}</span></div>'
 
 
-def render_findings_html(state: str = "idle", variance: float = 100.0, reason: str = "", chaos_triggered: bool = False) -> str:
+def render_findings_html(
+    state: str = "idle",
+    variance: float = 100.0,
+    reason: str = "",
+    chaos_triggered: bool = False,
+    policy_violations: Optional[list[dict[str, Any]]] = None,
+) -> str:
     if state == "idle":
         return '<div class="findings-idle">AUDIT FINDINGS :: Awaiting LangGraph execution...</div>'
     if state == "scanning":
         return '<div class="findings-idle">AUDIT FINDINGS :: Cross-referencing PO, GR, and Invoice...</div>'
-    if not chaos_triggered and variance <= 0:
+    violations = policy_violations or []
+    if not chaos_triggered and variance <= 0 and not violations:
         return (
             '<div class="findings-idle" style="border-left:5px solid #10B981;color:#A7F3D0;">'
             '<strong style="color:#34D399;">3-WAY MATCH VERIFIED: CLEARED FOR PAYMENT ($0.00 VARIANCE)</strong><br>'
             'All line items and Goods Receipt quantities match the authorized PO.'
             "</div>"
         )
-    headline = (
-        f"VISION ALERT + ${variance:,.2f} OVERCHARGE"
-        if (chaos_triggered and variance > 0)
-        else ("VISION ALERT: SHORT-PAYMENT INITIATED" if chaos_triggered else f"DISCREPANCY DETECTED: ${variance:,.2f} OVERCHARGE")
-    )
+    if chaos_triggered and variance > 0:
+        headline = f"VISION ALERT + ${variance:,.2f} OVERCHARGE"
+    elif chaos_triggered:
+        headline = "VISION ALERT: SHORT-PAYMENT INITIATED"
+    elif variance > 0:
+        headline = f"DISCREPANCY DETECTED: ${variance:,.2f} OVERCHARGE"
+    else:
+        actions = ", ".join(dict.fromkeys(str(v.get("action") or "POLICY_HOLD") for v in violations))
+        headline = f"DISCREPANCY DETECTED // POLICY EXCEPTION ({escape(actions)})"
     return f'<div class="alert-box"><div class="alert-title">{headline}</div><div class="alert-body">{escape(reason)}</div></div>'
 
 
@@ -1831,12 +2082,14 @@ def run_audit(
     apply_tax: bool = False,
     custom_rule_text: str = "",
     custom_rule_file: Any = None,
+    policies: Optional[list[dict[str, Any]]] = None,
 ) -> Generator[tuple[Any, ...], None, None]:
     """Execute the 5-Node LangGraph StateGraph against live/edited PO, GR, and Invoice inputs."""
     sc = SCENARIOS.get(scenario_name, SCENARIOS[DEFAULT_SCENARIO])
     live_po_text = (po_text_input or "").strip() or sc["po_text"]
     live_inv_text = (inv_text_input or "").strip() or sc["inv_text"]
     custom_rule = _extract_custom_rule(custom_rule_text, custom_rule_file)
+    active_policies = policies if policies is not None else load_policies()
     init_logs: list[str] = []
     if custom_rule:
         init_logs.append(_log(f'[POLICY HOT-SWAP] Injecting custom rule: "{custom_rule}" into Auditor Node...'))
@@ -1879,6 +2132,8 @@ def run_audit(
         "status": "running",
         "custom_rule": custom_rule,
         "hot_swap_violation": {"violated": False, "rule": custom_rule},
+        "policies": active_policies,
+        "policy_violations": [],
         "step_logs": [],
         "logs": [],
     }
@@ -1909,6 +2164,7 @@ def run_audit(
                     gr_data = snapshot.get("gr_data") or {}
                     inv_data = snapshot.get("invoice_data") or {}
                     disc = snapshot.get("discrepancy") or {}
+                    p_violations = snapshot.get("policy_violations") or disc.get("policy_violations") or []
 
                     has_po = bool(po_data)
                     has_gr = bool(gr_data)
@@ -1948,6 +2204,7 @@ def run_audit(
                         "rag_clause": (po_data.get("retrieved_sections") or ["Section 1.2"])[0],
                         "po_text": live_po_text,
                         "invoice_text": live_inv_text,
+                        "policy_violations": p_violations,
                     }
 
                     chat_init = (
@@ -1960,6 +2217,19 @@ def run_audit(
                     )
                     ledger_rows, _ = build_ledger_rows_and_total()
                     active_gr_img = gr_data.get("image_path") or gr_image or DEFAULT_GR_IMAGE_PATH
+                    variance_disp = (
+                        f"+${variance:,.2f}"
+                        if (flagged and variance > 0)
+                        else (
+                            "VISION HOLD"
+                            if (flagged and chaos_hit)
+                            else (
+                                "POLICY HOLD"
+                                if flagged
+                                else ("$0.00" if is_done else "--")
+                            )
+                        )
+                    )
 
                     last_payload = (
                         gr.update(interactive=is_done, value="Execute 3-Way Match" if is_done else "Executing Pipeline..."),
@@ -1969,11 +2239,17 @@ def run_audit(
                             gr_verified=gr_ver,
                             gr_state=gr_st,
                             invoice_billed=f"${inv_amt:,.2f}" if has_inv else "--",
-                            variance=(f"+${variance:,.2f}" if (flagged and variance > 0) else ("VISION HOLD" if (flagged and chaos_hit) else ("$0.00" if (is_done and not flagged) else "--"))),
+                            variance=variance_disp,
                             variance_state="alert" if flagged else "neutral",
                         ),
                         "\n".join(cumulative_logs),
-                        render_findings_html("done" if (is_done or flagged) else "scanning", variance=variance, reason=disc.get("reason", ""), chaos_triggered=chaos_hit),
+                        render_findings_html(
+                            "done" if (is_done or flagged) else "scanning",
+                            variance=variance,
+                            reason=disc.get("reason", ""),
+                            chaos_triggered=chaos_hit,
+                            policy_violations=p_violations,
+                        ),
                         snapshot.get("dispute_email", ""),
                         render_po_html_from_text(live_po_text, highlight=has_po),
                         render_invoice_html_from_text(
@@ -1981,7 +2257,7 @@ def run_audit(
                             audit_mode,
                             apply_tax=apply_tax,
                             annotated_items=disc.get("annotated_inv_items"),
-                            flagged=flagged and variance > 0,
+                            flagged=flagged and (variance > 0 or bool(p_violations)),
                             cleared=(is_done and not flagged),
                         ),
                         vision_badge,
@@ -1995,6 +2271,7 @@ def run_audit(
                         render_hot_swap_alert_html(
                             custom_rule=custom_rule,
                             violated=bool((snapshot.get("hot_swap_violation") or {}).get("violated")),
+                            policy_violations=p_violations,
                         ),
                     )
                     yield last_payload
@@ -2023,6 +2300,173 @@ def run_audit(
     finally:
         if last_payload is not None and not last_payload[0].get("interactive", False):
             yield (gr.update(interactive=True, value="Execute 3-Way Match"), *last_payload[1:])
+
+
+def _format_policy_status_md(policies: Optional[list[dict[str, Any]]] = None) -> str:
+    """Format a concise live summary of the active rules loaded from policies.json."""
+    rules = policies if policies is not None else load_policies()
+    active_count = sum(1 for r in rules if r.get("active", True))
+    tags = ", ".join(f"`{r.get('id', 'POL')}`" for r in rules[:8])
+    if len(rules) > 8:
+        tags += f" (+{len(rules) - 8} more)"
+    suffix = f" — {tags}" if tags else ""
+    return f"**Live Policy Engine:** `{active_count}` active / `{len(rules)}` total rule(s) in `policies.json`{suffix}"
+
+
+def _next_policy_id(policies: list[dict[str, Any]]) -> str:
+    max_num = 0
+    for rule in policies:
+        m = re.search(r"(\d+)$", str(rule.get("id") or ""))
+        if m:
+            max_num = max(max_num, int(m.group(1)))
+    return f"POL-{max(max_num + 1, len(policies) + 1):03d}"
+
+
+def _parse_rule_value(op: str, raw_val: Any) -> tuple[bool, Any, str]:
+    """Parse a Quick Rule Builder threshold/value string according to the operator."""
+    if raw_val is None or (isinstance(raw_val, str) and not raw_val.strip()):
+        return False, None, "Threshold / Value cannot be empty."
+
+    if op in (">", ">=", "<"):
+        text = str(raw_val).strip().replace("$", "").replace(",", "").replace("%", "").strip()
+        try:
+            num = float(text)
+        except ValueError:
+            return False, None, f"Operator `{op}` requires a numeric threshold, got `{raw_val}`."
+        if not math.isfinite(num):
+            return False, None, f"Operator `{op}` requires a finite numeric threshold."
+        return True, (int(num) if num.is_integer() else num), ""
+
+    if op == "!=":
+        text = str(raw_val).strip()
+        cleaned = text.replace("$", "").replace(",", "").replace("%", "").strip()
+        try:
+            num = float(cleaned)
+            if math.isfinite(num):
+                return True, (int(num) if num.is_integer() else num), ""
+        except ValueError:
+            pass
+        return True, text, ""
+
+    if op == "contains_any":
+        if isinstance(raw_val, (list, tuple)):
+            terms = [str(x).strip() for x in raw_val if str(x).strip()]
+        else:
+            text = str(raw_val).strip()
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    loaded = json.loads(text)
+                    terms = [str(x).strip() for x in loaded if str(x).strip()] if isinstance(loaded, list) else [text]
+                except Exception:
+                    terms = [t.strip() for t in text.split(",") if t.strip()]
+            else:
+                terms = [t.strip() for t in text.split(",") if t.strip()]
+        if not terms:
+            return False, None, "Operator `contains_any` requires at least one keyword (comma-separated)."
+        return True, terms, ""
+
+    return False, None, f"Unsupported operator `{op}`."
+
+
+def _on_policy_file_upload(file_path: Optional[str]) -> tuple[Any, str]:
+    """Load an uploaded .json or .yaml policy file into the live Code editor and validate it."""
+    if not file_path or not os.path.isfile(str(file_path)):
+        return gr.update(), _format_policy_status_md()
+    try:
+        raw = Path(str(file_path)).read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return gr.update(), f"⚠️ **Upload Read Error:** {exc}"
+
+    rules, msg = parse_policy_text(raw)
+    name = os.path.basename(str(file_path))
+    if not msg.startswith("Parsed "):
+        return raw, f"⚠️ **Invalid Policy File (`{name}`):** {msg}"
+    return (
+        raw,
+        f"📄 **Loaded `{name}`** ({msg}). Click **🔄 Hot-Swap Config & Re-Run Audit** to persist and re-audit ({len(rules)} rules).",
+    )
+
+
+def add_rule_and_reaudit(
+    r_name: str,
+    r_field: str,
+    r_op: str,
+    r_val: str,
+    r_sev: str,
+    r_act: str,
+    *audit_args: Any,
+) -> Generator[tuple[Any, ...], None, None]:
+    """Persist a new Quick Rule Builder rule to policies.json and stream a live re-audit."""
+    ok, parsed_val, err_msg = _parse_rule_value(str(r_op or ""), r_val)
+    if not ok:
+        yield (gr.update(), f"⚠️ **Rule Validation Error:** {err_msg}", *([gr.update()] * 17))
+        return
+
+    policies = load_policies()
+    next_id = _next_policy_id(policies)
+    rule_name = (r_name or "").strip() or f"{r_field} {r_op} {parsed_val}"
+    new_rule: dict[str, Any] = {
+        "id": next_id,
+        "name": rule_name,
+        "field": str(r_field or "invoice_total").strip(),
+        "operator": str(r_op or ">").strip(),
+        "value": parsed_val,
+        "severity": str(r_sev or "CRITICAL").strip(),
+        "action": str(r_act or "BLOCK_PAYMENT").strip(),
+        "active": True,
+    }
+    policies.append(new_rule)
+    save_policies(policies)
+
+    updated_json = json.dumps(policies, indent=2, ensure_ascii=False)
+    active_count = sum(1 for r in policies if r.get("active", True))
+    banner = (
+        f"✅ **Hot-Swapped Rule `{next_id}` (`{rule_name}`):** "
+        f"`{new_rule['field']} {new_rule['operator']} {parsed_val}` → `{new_rule['action']}` "
+        f"| `{active_count}` active / `{len(policies)}` total rule(s) in `policies.json`."
+    )
+    for frame in run_audit(*audit_args, policies=policies):
+        yield (updated_json, banner, *frame)
+
+
+def hotswap_config_and_reaudit(
+    raw_policy_text: str,
+    uploaded_policy_file: Any = None,
+    *audit_args: Any,
+) -> Generator[tuple[Any, ...], None, None]:
+    """Parse JSON/YAML policy config, persist to policies.json, and stream a live re-audit."""
+    source_text = (raw_policy_text or "").strip()
+    if not source_text and uploaded_policy_file:
+        file_path = getattr(uploaded_policy_file, "name", uploaded_policy_file)
+        if file_path and os.path.isfile(str(file_path)):
+            try:
+                source_text = Path(str(file_path)).read_text(encoding="utf-8", errors="replace").strip()
+            except Exception as exc:
+                yield (
+                    raw_policy_text or "",
+                    f"⚠️ **File Read Error:** {exc}",
+                    *([gr.update()] * 17),
+                )
+                return
+
+    rules, msg = parse_policy_text(source_text)
+    if not msg.startswith("Parsed "):
+        yield (
+            raw_policy_text or source_text,
+            f"⚠️ **Hot-Swap Rejected:** {msg}",
+            *([gr.update()] * 17),
+        )
+        return
+
+    save_policies(rules)
+    updated_json = json.dumps(rules, indent=2, ensure_ascii=False)
+    active_count = sum(1 for r in rules if r.get("active", True))
+    banner = (
+        f"✅ **Hot-Swapped Policy Config:** {msg} Saved to `policies.json` "
+        f"(`{active_count}` active / `{len(rules)}` total)."
+    )
+    for frame in run_audit(*audit_args, policies=rules):
+        yield (updated_json, banner, *frame)
 
 
 # ==============================================================================
@@ -2136,6 +2580,95 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
                                     close_pay_btn = gr.Button("Close", elem_classes=["ov-quick-btn"], scale=1)
                                 pay_success_banner = gr.HTML(value="")
 
+                    with gr.Accordion(
+                        "⚡ Zero-Code Policy Hot-Swap & Re-Audit (Live Rule Engine)",
+                        open=True,
+                        elem_classes=["ov-policy-accordion"],
+                    ):
+                        policy_status = gr.Markdown(
+                            value=_format_policy_status_md(),
+                            elem_classes=["ov-policy-status"],
+                        )
+                        with gr.Tabs():
+                            with gr.Tab("Quick Rule Builder (UI Form)"):
+                                with gr.Row():
+                                    r_name = gr.Textbox(
+                                        label="Rule Name",
+                                        placeholder="e.g., Block Invoices Over $400",
+                                        scale=2,
+                                        elem_classes=["ov-doc-editor"],
+                                    )
+                                    r_field = gr.Dropdown(
+                                        label="Field",
+                                        choices=[
+                                            "invoice_total",
+                                            "variance",
+                                            "tax_pct",
+                                            "short_shipped_units",
+                                            "invoice_text",
+                                            "vendor_name",
+                                            "po_total",
+                                        ],
+                                        value="invoice_total",
+                                        interactive=True,
+                                        scale=1,
+                                    )
+                                    r_op = gr.Dropdown(
+                                        label="Operator",
+                                        choices=[">", ">=", "<", "!=", "contains_any"],
+                                        value=">",
+                                        interactive=True,
+                                        scale=1,
+                                    )
+                                    r_val = gr.Textbox(
+                                        label="Threshold / Value",
+                                        placeholder="e.g., 400 or setup fee, rush fee",
+                                        scale=2,
+                                        elem_classes=["ov-doc-editor"],
+                                    )
+                                with gr.Row(elem_classes=["ov-policy-form-row"]):
+                                    r_sev = gr.Dropdown(
+                                        label="Severity",
+                                        choices=["CRITICAL", "HIGH", "MEDIUM"],
+                                        value="CRITICAL",
+                                        interactive=True,
+                                        scale=1,
+                                    )
+                                    r_act = gr.Dropdown(
+                                        label="Action",
+                                        choices=["BLOCK_PAYMENT", "FLAG_CFO_REVIEW", "AUTO_DISPUTE"],
+                                        value="BLOCK_PAYMENT",
+                                        interactive=True,
+                                        scale=1,
+                                    )
+                                    btn_add_reaudit = gr.Button(
+                                        "➕ Add Rule & Re-Run Audit",
+                                        elem_classes=["ov-hotswap-btn"],
+                                        scale=2,
+                                    )
+                            with gr.Tab("Raw JSON / YAML Config"):
+                                policy_editor = gr.Code(
+                                    value=json.dumps(load_policies(), indent=2),
+                                    language="json",
+                                    label="Live Policy Rules (JSON / YAML)",
+                                    lines=10,
+                                    max_lines=18,
+                                    interactive=True,
+                                    elem_classes=["ov-policy-code"],
+                                )
+                                with gr.Row(elem_classes=["ov-policy-form-row"]):
+                                    policy_file_upload = gr.File(
+                                        label="Upload .json / .yaml Policy File",
+                                        file_types=[".json", ".yaml", ".yml"],
+                                        type="filepath",
+                                        scale=2,
+                                    )
+                                    btn_hotswap_reaudit = gr.Button(
+                                        "🔄 Hot-Swap Config & Re-Run Audit",
+                                        elem_classes=["ov-hotswap-btn"],
+                                        scale=1,
+                                    )
+
                 with gr.Tab("Compliance Ledger & Export"):
                     ledger_kpi_html = gr.HTML(value=render_ledger_kpi_html())
                     ledger_table = gr.Dataframe(
@@ -2231,6 +2764,32 @@ with gr.Blocks(title="PROJECT OVERLORD // FINANCIAL DEFENSE ENGINE", fill_width=
         outputs=audit_outputs,
         show_progress="hidden",
         concurrency_limit=1,
+    )
+    policy_file_upload.change(
+        fn=_on_policy_file_upload,
+        inputs=[policy_file_upload],
+        outputs=[policy_editor, policy_status],
+        queue=False,
+    )
+    btn_add_reaudit.click(
+        fn=add_rule_and_reaudit,
+        inputs=[r_name, r_field, r_op, r_val, r_sev, r_act, *audit_inputs],
+        outputs=[policy_editor, policy_status, *audit_outputs],
+        show_progress="hidden",
+        concurrency_limit=1,
+    )
+    btn_hotswap_reaudit.click(
+        fn=hotswap_config_and_reaudit,
+        inputs=[policy_editor, policy_file_upload, *audit_inputs],
+        outputs=[policy_editor, policy_status, *audit_outputs],
+        show_progress="hidden",
+        concurrency_limit=1,
+    )
+    demo.load(
+        fn=lambda: (json.dumps(load_policies(), indent=2), _format_policy_status_md()),
+        inputs=None,
+        outputs=[policy_editor, policy_status],
+        queue=False,
     )
 
     chat_send_btn.click(
